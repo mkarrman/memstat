@@ -33,6 +33,8 @@ void print_help_and_exit(void)
 	"Usage: memstat [OPTIONS] <PID> [<PID> ...]\n"
 	"Where OPTIONS are:\n"
 	" -h --help        Show this help text and exit.\n"
+	" -c --shr-count   Print the sharing count of each page. Appears\n"
+	"                  before the respective mapping in output.\n"
 	" -v --verbose     Show detailed information for each process.\n"
 	"PID are one or more PID's for running processes.\n"
 	"Displayed metrics include:\n"
@@ -60,6 +62,7 @@ int main(int argc, char *argv[])
 	char line[256];
 	int c;
 	struct {
+		unsigned shr_count : 1;
 		unsigned verbose : 1;
 	} args;
 	unsigned pid;
@@ -87,10 +90,11 @@ int main(int argc, char *argv[])
 	memset(&args, 0, sizeof(args));
 
 	for (;;) {
-		static char sopt[] = "hv";
+		static char sopt[] = "chv";
 		static struct option lopt[] = {
-			{ "help",    no_argument, 0, 'h' },
-			{ "verbose", no_argument, 0, 'v' },
+			{ "shr-count", no_argument, 0, 'c' },
+			{ "help",      no_argument, 0, 'h' },
+			{ "verbose",   no_argument, 0, 'v' },
 			{ NULL, 0, 0, 0 }
 		};
 
@@ -99,6 +103,9 @@ int main(int argc, char *argv[])
 			break;
 			
 		switch (c) {
+		case 'c':
+			args.shr_count = 1;
+			break;
 		case 'h':
 			print_help_and_exit();
 			break;
@@ -281,6 +288,9 @@ int main(int argc, char *argv[])
 					if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
 						die("read(kpc_fd) failed");
 
+					if (args.shr_count)
+						printf("%" PRIu64 " ", data.u);
+
 					if (!data.u) {
 						/* should never be... */
 					} else if (data.u == 1) {
@@ -294,6 +304,10 @@ int main(int argc, char *argv[])
 
 				--pages;
 			}
+
+
+			if (args.shr_count)
+				printf("\n");
 
 			if (args.verbose)
 				printf("        %11" PRIu64 " %11" PRIu64

@@ -15,8 +15,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
- 
-#include <stdint.h>
+
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,7 +62,7 @@ int main(int argc, char *argv[])
 	struct {
 		unsigned verbose : 1;
 	} args;
-	uint32_t pid;
+	unsigned pid;
 	int kpc_fd;
 	int kpf_fd;
 	FILE *ms_file;
@@ -231,7 +231,7 @@ int main(int argc, char *argv[])
 			}
 
 			/* only vsyscall here (hopefully) */
-			if (vstart & (1ul << 63))
+			if (vstart & ((uint64_t)1 << 63))
 				continue;
 
 			vm = vend - vstart;
@@ -261,17 +261,17 @@ int main(int argc, char *argv[])
 				 */
 
 				loaded = 0;
-				if (data.u & (1ul<<63)) {
+				if (data.u & ((uint64_t)1<<63)) {
 					rss += PAGE_SIZE;
 					loaded = 1;
 				}
-				if (data.u & (1ul<<62)) {
+				if (data.u & ((uint64_t)1<<62)) {
 					swp += PAGE_SIZE;
 					loaded = 1;
 				}
 
 				if (loaded) {
-					pfn = data.u & 0x3ffffffffffffful;
+					pfn = data.u & (uint64_t)0x3fffffffffffff;
 
 					/* kernel page count */
 					kpc_offset = pfn * sizeof(uint64_t);
@@ -296,7 +296,9 @@ int main(int argc, char *argv[])
 			}
 
 			if (args.verbose)
-				printf("        %11lu %11lu %11lu %11lu %11lu %11lu %s %s\n",
+				printf("        %11" PRIu64 " %11" PRIu64
+				       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+				       " %11" PRIu64 " %s %s\n",
 				       vm, rss, swp, uss, shr, wss, perms, backing);
 
 			vm_total += vm;
@@ -308,11 +310,13 @@ int main(int argc, char *argv[])
 		}
 
 		if (args.verbose)
-			printf("   Tot: %11lu %11lu %11lu %11lu %11lu %11lu\n",
+			printf("   Tot: %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+			       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 "\n",
 			       vm_total, rss_total, swp_total, uss_total,
 			       shr_total, wss_total);
 		else
-			printf("%7u %11lu %11lu %11lu %11lu %11lu %11lu %s\n",
+			printf("%7u %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+			       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s\n",
 			       pid, vm_total, rss_total, swp_total, uss_total,
 			       shr_total, wss_total, cmdline);
 
@@ -322,7 +326,7 @@ int main(int argc, char *argv[])
 		fclose(ms_file);
 	}
 
-	printf("WSS grand total = %lu\n", wss_grand_total);
+	printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
 
 	close(kpc_fd);
 	close(kpf_fd);

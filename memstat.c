@@ -1,6 +1,3 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
 /*
  * memstat - Process memory usage analysis tool
  * Copyright (C) 2021  Mats Karrman  <mats.dev.list.at.gmail.com>
@@ -16,6 +13,9 @@
  * GNU General Public License for more details.
  */
 
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,22 +29,38 @@
 void print_help_and_exit(void)
 {
 	printf(
-	"Process memory usage analysis tool\n"
-	"Usage: memstat [OPTIONS] <PID> [<PID> ...]\n"
-	"Where OPTIONS are:\n"
-	" -h --help        Show this help text and exit.\n"
-	" -c --shr-count   Print the sharing count of each page. Appears\n"
-	"                  before the respective mapping in output.\n"
-	" -v --verbose     Show detailed information for each process.\n"
-	"PID are one or more PID's for running processes.\n"
-	"Displayed metrics include:\n"
-	" VM    Virtual Memory - total amount of memory reserved.\n"
-	" RSS   Resident Set Size - total size in physical memory.\n"
-	" SWP   Swap - total size in swap space.\n"
-	" USS   Unique Set Size - total size private to this process.\n"
-	" SHR   Shared - total size shared with other processes.\n"
-	" WSS   Weighted Set Size - USS plus each SHR page divided by\n"
-	"       the number of referencing processes for that page.\n"
+
+"Process memory usage analysis tool\n"
+"\n"
+"Usage: memstat [OPTIONS] PID [PID ...]\n"
+"\n"
+"Where OPTIONS are:\n"
+" -h --help        Show this help text and exit.\n"
+" -c --shr-count   Print the sharing count of each page. Appears before the\n"
+"                  respective mapping in output.\n"
+" -p --private     Include private mappings.\n"
+" -r --read        Include mappings with read permission.\n"
+" -s --shared      Include shared mappings.\n"
+" -v --verbose     Show detailed information for each process.\n"
+" -w --write       Include mappings with write permission.\n"
+" -x --execute     Include mappings with execute permission.\n"
+"\n"
+"PID are one or more PID's for running processes. Processes without cmdline\n"
+"info are skipped (kernel processes).\n"
+"\n"
+"If neither of read, write or execute permission is specified, all are\n"
+"included. If neither of private or shared mappings are specified, both\n"
+"kinds are included.\n"
+"\n"
+"Displayed metrics include:\n"
+" VM   Virtual Memory    - total size of all pages mapped.\n"
+" RSS  Resident Set Size - total size of pages in physical memory.\n"
+" SWP  Swap              - total size of pages in swap space.\n"
+" USS  Unique Set Size   - total size of pages with a reference count of one.\n"
+" SHR  Shared            - total size of pages shared with other processes.\n"
+" WSS  Weighted Set Size - USS plus each SHR page divided by the number of\n"
+"                          referencing processes for that page.\n"
+
 	);
 	exit(EXIT_SUCCESS);
 }
@@ -62,6 +78,11 @@ int main(int argc, char *argv[])
 	char line[256];
 	int c;
 	struct {
+		unsigned p_read : 1;
+		unsigned p_write : 1;
+		unsigned p_execute : 1;
+		unsigned p_private : 1;
+		unsigned p_shared : 1;
 		unsigned shr_count : 1;
 		unsigned verbose : 1;
 	} args;
@@ -90,11 +111,16 @@ int main(int argc, char *argv[])
 	memset(&args, 0, sizeof(args));
 
 	for (;;) {
-		static char sopt[] = "chv";
+		static char sopt[] = "chprsvwx";
 		static struct option lopt[] = {
 			{ "shr-count", no_argument, 0, 'c' },
 			{ "help",      no_argument, 0, 'h' },
+			{ "private",   no_argument, 0, 'p' },
+			{ "read",      no_argument, 0, 'r' },
+			{ "shared",    no_argument, 0, 's' },
 			{ "verbose",   no_argument, 0, 'v' },
+			{ "write",     no_argument, 0, 'w' },
+			{ "execute",   no_argument, 0, 'x' },
 			{ NULL, 0, 0, 0 }
 		};
 
@@ -109,8 +135,23 @@ int main(int argc, char *argv[])
 		case 'h':
 			print_help_and_exit();
 			break;
+		case 'p':
+			args.p_private = 1;
+			break;
+		case 'r':
+			args.p_read = 1;
+			break;
+		case 's':
+			args.p_shared = 1;
+			break;
 		case 'v':
 			args.verbose = 1;
+			break;
+		case 'w':
+			args.p_write = 1;
+			break;
+		case 'x':
+			args.p_execute = 1;
 			break;
 		default:
 			die("Illegal option");
@@ -120,7 +161,13 @@ int main(int argc, char *argv[])
 	if ((argc - optind) < 1)
 		die("No PID specified. See --help.");
 
+	if (!args.p_read && !args.p_write && !args.p_execute)
+		args.p_read = args.p_write = args.p_execute = 1;
+	if (!args.p_private && !args.p_shared)
+		args.p_private = args.p_shared = 1;
+
 	/* Get kernel version using uname() */
+	/* Get kenel page size */
 
 	kpc_fd = open("/proc/kpagecount", O_RDONLY);
 	if (kpc_fd < 0)
@@ -197,36 +244,36 @@ int main(int argc, char *argv[])
 			if (end && *end != ' ')
 				die("missing ' '");
 
-			if (args.verbose) {
+			/* perms */
+			in = end + 1;
+			memcpy(perms, in, 4);
+			perms[4] = 0;
+			in += 4;
+			if (*in != ' ')
+				die("missing ' '");
 
-				/* perms */
-				in = end + 1;
-				memcpy(perms, in, 4);
-				perms[4] = 0;
-				in += 4;
-				if (*in != ' ')
-					die("missing '-'");
+			if (args.verbose) {
 
 				/* skip offset */
 				in += 1;
 				while (*in && *in != ' ')
 					++in;
 				if (*in != ' ')
-					die("missing '-'");
+					die("missing ' '");
 
 				/* skip dev */
 				in += 1;
 				while (*in && *in != ' ')
 					++in;
 				if (*in != ' ')
-					die("missing '-'");
+					die("missing ' '");
 
 				/* skip inode */
 				in += 1;
 				while (*in && *in != ' ')
 					++in;
 				if (*in != ' ')
-					die("missing '-'");
+					die("missing ' '");
 
 				/* backing (pathname) */
 				while (*in == ' ')
@@ -250,70 +297,76 @@ int main(int argc, char *argv[])
 			shr = 0;
 			wss = 0;
 
-			if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
-				die("lseek(pm_offset) failed");
+			if (( (args.p_read && perms[0] == 'r') ||
+			      (args.p_write && perms[1] == 'w') ||
+			      (args.p_execute && perms[2] == 'x') ) &&
+			    ( (args.p_private && perms[3] == 'p') ||
+			      (args.p_shared && perms[3] == 's') )) {
 
-			while (pages) {
+				if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
+					die("lseek(pm_offset) failed");
 
-				if (read(pm_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
-					die("read(pm_fd) failed");
+				while (pages) {
 
-				/*
-				 * 63   Present in RAM
-				 * 62   In SWAP
-				 * 61   File-mapped or shared anonymous page
-				 * 56   Exclusively mapped
-				 * 55   PTE soft-dirty
-				 * 54-0 Page frame number (if 63 set)
-				 */
+					if (read(pm_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
+						die("read(pm_fd) failed");
 
-				loaded = 0;
-				if (data.u & ((uint64_t)1<<63)) {
-					rss += PAGE_SIZE;
-					loaded = 1;
-				}
-				if (data.u & ((uint64_t)1<<62)) {
-					swp += PAGE_SIZE;
-					loaded = 1;
-				}
+					/*
+					 * 63   Present in RAM
+					 * 62   In SWAP
+					 * 61   File-mapped or shared anonymous page
+					 * 56   Exclusively mapped
+					 * 55   PTE soft-dirty
+					 * 54-0 Page frame number (if 63 set)
+					 */
 
-				if (loaded) {
-					pfn = data.u & (uint64_t)0x3fffffffffffff;
-
-					/* kernel page count */
-					kpc_offset = pfn * sizeof(uint64_t);
-					if (lseek(kpc_fd, kpc_offset, SEEK_SET) != kpc_offset)
-						die("lseek(kpc_fd) failed");
-
-					if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
-						die("read(kpc_fd) failed");
-
-					if (args.shr_count)
-						printf("%" PRIu64 " ", data.u);
-
-					if (!data.u) {
-						/* should never be... */
-					} else if (data.u == 1) {
-						uss += PAGE_SIZE;
-						wss += PAGE_SIZE;
-					} else {
-						shr += PAGE_SIZE;
-						wss += (PAGE_SIZE + data.u/2) / data.u;
+					loaded = 0;
+					if (data.u & ((uint64_t)1<<63)) {
+						rss += PAGE_SIZE;
+						loaded = 1;
 					}
+					if (data.u & ((uint64_t)1<<62)) {
+						swp += PAGE_SIZE;
+						loaded = 1;
+					}
+
+					if (loaded) {
+						pfn = data.u & (uint64_t)0x3fffffffffffff;
+
+						/* kernel page count */
+						kpc_offset = pfn * sizeof(uint64_t);
+						if (lseek(kpc_fd, kpc_offset, SEEK_SET) != kpc_offset)
+							die("lseek(kpc_fd) failed");
+
+						if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
+							die("read(kpc_fd) failed");
+
+						if (args.shr_count)
+							printf("%" PRIu64 " ", data.u);
+
+						if (!data.u) {
+							/* should never be... */
+						} else if (data.u == 1) {
+							uss += PAGE_SIZE;
+							wss += PAGE_SIZE;
+						} else {
+							shr += PAGE_SIZE;
+							wss += (PAGE_SIZE + data.u/2) / data.u;
+						}
+					}
+
+					--pages;
 				}
 
-				--pages;
+				if (args.shr_count)
+					printf("\n");
+
+				if (args.verbose)
+					printf("        %11" PRIu64 " %11" PRIu64
+					       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+					       " %11" PRIu64 " %s %s\n",
+					       vm, rss, swp, uss, shr, wss, perms, backing);
 			}
-
-
-			if (args.shr_count)
-				printf("\n");
-
-			if (args.verbose)
-				printf("        %11" PRIu64 " %11" PRIu64
-				       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-				       " %11" PRIu64 " %s %s\n",
-				       vm, rss, swp, uss, shr, wss, perms, backing);
 
 			vm_total += vm;
 			rss_total += rss;

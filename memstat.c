@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define CPU_SIZE  (sizeof(void *) * 8)
 #define PAGE_SIZE 4096
 
 void print_help_and_exit(void)
@@ -290,8 +291,8 @@ int main(int argc, char *argv[])
 				*end = '\0';
 			}
 
-			/* only vsyscall here (hopefully) */
-			if (vstart & ((uint64_t)1 << 63))
+			/* only vsyscall/vectors here (hopefully) */
+			if (vstart & ((uint64_t)1 << (CPU_SIZE-1)))
 				continue;
 
 			vm = vend - vstart;

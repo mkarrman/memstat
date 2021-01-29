@@ -38,6 +38,7 @@ void print_help_and_exit(void)
 " -h --help        Show this help text and exit.\n"
 " -c --shr-count   Print the sharing count of each page. Appears before the\n"
 "                  respective mapping in output.\n"
+" -k --kibyte      Display values in KiB instead of bytes.\n"
 " -p --private     Include private mappings.\n"
 " -r --read        Include mappings with read permission.\n"
 " -s --shared      Include shared mappings.\n"
@@ -78,6 +79,7 @@ int main(int argc, char *argv[])
 	char line[256];
 	int c;
 	struct {
+		unsigned kibyte : 1;
 		unsigned p_read : 1;
 		unsigned p_write : 1;
 		unsigned p_execute : 1;
@@ -111,10 +113,11 @@ int main(int argc, char *argv[])
 	memset(&args, 0, sizeof(args));
 
 	for (;;) {
-		static char sopt[] = "chprsvwx";
+		static char sopt[] = "chkprsvwx";
 		static struct option lopt[] = {
 			{ "shr-count", no_argument, 0, 'c' },
 			{ "help",      no_argument, 0, 'h' },
+			{ "kibyte",    no_argument, 0, 'k' },
 			{ "private",   no_argument, 0, 'p' },
 			{ "read",      no_argument, 0, 'r' },
 			{ "shared",    no_argument, 0, 's' },
@@ -134,6 +137,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'h':
 			print_help_and_exit();
+			break;
+		case 'k':
+			args.kibyte = 1;
 			break;
 		case 'p':
 			args.p_private = 1;
@@ -358,6 +364,22 @@ int main(int argc, char *argv[])
 					--pages;
 				}
 
+				vm_total += vm;
+				rss_total += rss;
+				swp_total += swp;
+				uss_total += uss;
+				shr_total += shr;
+				wss_total += wss;
+
+				if (args.kibyte) {
+					vm >>= 10;
+					rss >>= 10;
+					swp >>= 10;
+					uss >>= 10;
+					shr >>= 10;
+					wss >>= 10;
+				}
+
 				if (args.shr_count)
 					printf("\n");
 
@@ -367,13 +389,17 @@ int main(int argc, char *argv[])
 					       " %11" PRIu64 " %s %s\n",
 					       vm, rss, swp, uss, shr, wss, perms, backing);
 			}
+		}
 
-			vm_total += vm;
-			rss_total += rss;
-			swp_total += swp;
-			uss_total += uss;
-			shr_total += shr;
-			wss_total += wss;
+		wss_grand_total += wss_total;
+
+		if (args.kibyte) {
+			vm_total >>= 10;
+			rss_total >>= 10;
+			swp_total >>= 10;
+			uss_total >>= 10;
+			shr_total >>= 10;
+			wss_total >>= 10;
 		}
 
 		if (args.verbose)
@@ -387,11 +413,12 @@ int main(int argc, char *argv[])
 			       pid, vm_total, rss_total, swp_total, uss_total,
 			       shr_total, wss_total, cmdline);
 
-		wss_grand_total += wss_total;
-		
 		close(pm_fd);
 		fclose(ms_file);
 	}
+
+	if (args.kibyte)
+		wss_grand_total >>= 10;
 
 	printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
 

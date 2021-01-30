@@ -24,10 +24,33 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define CPU_SIZE  (sizeof(void *) * 8)
-#define PAGE_SIZE 4096
 
-void print_help_and_exit(void)
+/* process stats counters */
+struct pstats {
+	uint64_t vm, rss, swp, uss, shr, wss;
+};
+
+
+/* command line arguments */
+static struct {
+	unsigned all : 1;
+	unsigned bonus : 1;
+	unsigned kibyte : 1;
+	unsigned maps : 1;
+	unsigned shr_count : 1;
+	unsigned verbose : 1;
+	char perms[4];
+	unsigned *pids;
+} args;
+
+/* system config */
+static struct {
+	unsigned page_size;
+	//unsigned kernel_ver;
+} conf;
+
+
+static void print_help_and_exit(void)
 {
 	printf(
 
@@ -37,9 +60,14 @@ void print_help_and_exit(void)
 "\n"
 "Where OPTIONS are:\n"
 " -h --help        Show this help text and exit.\n"
-" -c --shr-count   Print the sharing count of each page. Appears before the\n"
-"                  respective mapping in output.\n"
+" -a --all         Include all processes (kernel too).\n"
+" -b --bonus       Print additional info (if any) not included in summing.\n"
+"                  Values appear before the respective mapping in output.\n"
+" -c --shr-count   Print the sharing count of each page. Requires -m/--maps.\n"
+"                  Values appear before the respective mapping in output.\n"
 " -k --kibyte      Display values in KiB instead of bytes.\n"
+" -m --maps        Calculate based on maps, pagemap and kpagecount instead of\n"
+"                  smaps proc file (slower).\n"
 " -p --private     Include private mappings.\n"
 " -r --read        Include mappings with read permission.\n"
 " -s --shared      Include shared mappings.\n"
@@ -47,12 +75,13 @@ void print_help_and_exit(void)
 " -w --write       Include mappings with write permission.\n"
 " -x --execute     Include mappings with execute permission.\n"
 "\n"
-"PID are one or more PID's for running processes. Processes without cmdline\n"
-"info are skipped (kernel processes).\n"
+"PID are one or more process identifiers for running processes. Processes\n"
+"without cmdline info are skipped unless -a/-all is specified.\n"
 "\n"
-"If neither of read, write or execute permission is specified, all are\n"
-"included. If neither of private or shared mappings are specified, both\n"
-"kinds are included.\n"
+"If neither of -r, -w or -x is specified, all permission combinations are\n"
+"included, otherwise all of those and only those specified must be set.\n"
+"If neither or both of -p or -s is specifiead, both mapping kinds are included,\n"
+"othewise only the specified kind is included.\n"
 "\n"
 "Displayed metrics include:\n"
 " VM   Virtual Memory    - total size of all pages mapped.\n"
@@ -61,46 +90,395 @@ void print_help_and_exit(void)
 " USS  Unique Set Size   - total size of pages with a reference count of one.\n"
 " SHR  Shared            - total size of pages shared with other processes.\n"
 " WSS  Weighted Set Size - USS plus each SHR page divided by the number of\n"
-"                          referencing processes for that page.\n"
+"                          referencing processes for that page. Sometimes\n"
+"                          called PSS - Proportional Set Size."
+"\n"
+"Note that -s/--shared refers to explicitly shared mappings, e.g. those used\n"
+"by tmpfs, while the SHR value refers to all pages shared between processes\n"
+"including both shared and private mappings. Private mappings are shared, e.g.\n"
+"for code when multiple copies of the same program is run or the same library\n"
+"is used by multiple programs.\n"
 
 	);
 	exit(EXIT_SUCCESS);
 }
 
-void die(const char *msg)
+static void die(const char *msg)
 {
 	fprintf(stderr, "ERROR: %s\n", msg);
 	exit(EXIT_FAILURE);
 }
-	
-int main(int argc, char *argv[])
+
+static void parse_command_line(int argc, char *argv[])
 {
-	char path[128];
-	char cmdline[256];
-	char line[256];
+	static char sopt[] = "abchkmprsvwx";
+	static struct option lopt[] = {
+		{ "all",       no_argument, 0, 'a' },
+		{ "bonus",     no_argument, 0, 'b' },
+		{ "shr-count", no_argument, 0, 'c' },
+		{ "help",      no_argument, 0, 'h' },
+		{ "kibyte",    no_argument, 0, 'k' },
+		{ "maps",      no_argument, 0, 'm' },
+		{ "private",   no_argument, 0, 'p' },
+		{ "read",      no_argument, 0, 'r' },
+		{ "shared",    no_argument, 0, 's' },
+		{ "verbose",   no_argument, 0, 'v' },
+		{ "write",     no_argument, 0, 'w' },
+		{ "execute",   no_argument, 0, 'x' },
+		{ NULL, 0, 0, 0 }
+	};
+	int pid_count;
+	unsigned *pid;
+	char *endptr;
 	int c;
-	struct {
-		unsigned kibyte : 1;
-		unsigned p_read : 1;
-		unsigned p_write : 1;
-		unsigned p_execute : 1;
-		unsigned p_private : 1;
-		unsigned p_shared : 1;
-		unsigned shr_count : 1;
-		unsigned verbose : 1;
-	} args;
-	unsigned pid;
-	int kpc_fd;
-	int kpf_fd;
-	FILE *ms_file;
-	int pm_fd;
-	uint64_t vm, rss, swp, uss, shr, wss;
-	uint64_t vm_total, rss_total, swp_total, uss_total, shr_total, wss_total;
-	uint64_t wss_grand_total;
-	char *in, *end;
-	uint64_t vstart, vend;
+
+	memcpy(args.perms, "---", 3);
+
+	for (;;) {
+		c = getopt_long(argc, argv, sopt, lopt, NULL);
+		if (c == -1)
+			break;
+			
+		switch (c) {
+		case 'a':
+			args.all = 1;
+			break;
+		case 'b':
+			args.bonus = 1;
+			break;
+		case 'c':
+			args.shr_count = 1;
+			break;
+		case 'h':
+			print_help_and_exit();
+			break;
+		case 'k':
+			args.kibyte = 1;
+			break;
+		case 'm':
+			args.maps = 1;
+			break;
+		case 'p':
+			if (args.perms[3] == 's')
+				args.perms[3] = '\0';
+			else
+				args.perms[3] = 'p';
+			break;
+		case 'r':
+			args.perms[0] = 'r';
+			break;
+		case 's':
+			if (args.perms[3] == 'p')
+				args.perms[3] = '\0';
+			else
+				args.perms[3] = 's';
+			break;
+		case 'v':
+			args.verbose = 1;
+			break;
+		case 'w':
+			args.perms[1] = 'w';
+			break;
+		case 'x':
+			args.perms[2] = 'x';
+			break;
+		default:
+			die("Illegal option");
+		}
+	}
+
+	if (!memcmp(args.perms, "---", 3))
+		args.perms[0] = '\0';
+
+	if (args.shr_count && !args.maps)
+		die("-c option requires -m too");
+
+	pid_count = argc - optind;
+	if (pid_count < 1)
+		die("No PID specified. See --help.");
+
+	args.pids = calloc(pid_count + 1, sizeof(*args.pids));
+	if (!args.pids)
+		die("Failed to allocate pids memory");
+
+	pid = args.pids;
+	while (optind < argc) {
+		*pid = strtoul(argv[optind], &endptr, 0);
+		if (!*pid || *endptr)
+			die("Invalid PID specified");
+		++pid;
+		++optind;
+	}
+}
+
+static void get_system_config(void)
+{
+	long conf_val;
+
+	conf_val = sysconf(_SC_PAGE_SIZE);
+	if (conf_val < 0)
+		die("sysconf(_SC_PAGE_SIZE) failed");
+	conf.page_size = conf_val;
+
+	/* Get kernel version using uname() */
+}
+
+static void print_heading(void)
+{
+	printf("-PID--- -VM-------- -RSS------- -SWP------- -USS------- "
+	       "-SHR------- -WSS------- -Cmdline------- - - -\n");
+}
+
+static void print_verbose_heading(unsigned pid, const char *cmdline)
+{
+	printf("%7u %s\n", pid, cmdline);
+	printf("        -VM-------- -RSS------- -SWP------- -USS------- "
+	       "-SHR------- -WSS------- perm -pathname------- - - -\n");
+}
+
+static void print_share_count(unsigned count)
+{
+	printf("%u ", count);
+}
+
+static void print_bonus_info(const char *tag, uint64_t val)
+{
+	printf("- %-17s%10" PRIu64 "\n", tag, val);
+}
+
+static void print_verbose_counts(struct pstats *count,
+                                 const char *perms, const char *backing)
+{
+	printf("        %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s %s\n",
+	       count->vm, count->rss, count->swp, count->uss,
+	       count->shr, count->wss, perms, backing);
+}
+
+static void print_verbose_totals(struct pstats *total)
+{
+	printf("   Tot: %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 "\n",
+	       total->vm, total->rss, total->swp, total->uss,
+	       total->shr, total->wss);
+}
+
+static void print_totals(unsigned pid, struct pstats *total, const char *cmdline)
+{
+	printf("%7u %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s\n",
+	       pid, total->vm, total->rss, total->swp, total->uss,
+	       total->shr, total->wss, cmdline);
+}
+
+static void print_footer(uint64_t wss_grand_total)
+{
+	printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
+}
+
+static void add_to_pstats(struct pstats *sum, struct pstats *add)
+{
+	sum->vm  += add->vm;
+	sum->rss += add->rss;
+	sum->swp += add->swp;
+	sum->uss += add->uss;
+	sum->shr += add->shr;
+	sum->wss += add->wss;
+}
+
+static void reduce_pstats_to_kib(struct pstats *pst)
+{
+	pst->vm  >>= 10;
+	pst->rss >>= 10;
+	pst->swp >>= 10;
+	pst->uss >>= 10;
+	pst->shr >>= 10;
+	pst->wss >>= 10;
+}
+
+static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
+                            char *perms, char *backing)
+{
+	const char *in;
+	char *end;
+
+	/* vstart */
+	in = line;
+	*vstart = strtoul(in, &end, 16);
+	if (end && *end != '-')
+		die("missing '-'");
+
+	/* vend */
+	in = end + 1;
+	*vsize = strtoul(in, &end, 16) - *vstart;
+	if (end && *end != ' ')
+		die("missing ' '");
+
+	/* perms */
+	in = end + 1;
+	memcpy(perms, in, 4);
+	perms[4] = 0;
+	in += 4;
+	if (*in != ' ')
+		die("missing ' '");
+
+	if (args.verbose) {
+
+		/* skip offset */
+		in += 1;
+		while (*in && *in != ' ')
+			++in;
+		if (*in != ' ')
+			die("missing ' '");
+
+		/* skip dev */
+		in += 1;
+		while (*in && *in != ' ')
+			++in;
+		if (*in != ' ')
+			die("missing ' '");
+
+		/* skip inode */
+		in += 1;
+		while (*in && *in != ' ')
+			++in;
+		if (*in != ' ')
+			die("missing ' '");
+
+		/* backing (pathname) */
+		while (*in == ' ')
+			++in;
+		end = backing;
+		while (*in != '\n' && *in != '\0')
+			*end++ = *in++;
+		*end = '\0';
+	}
+}
+
+static uint64_t read_smaps_count(const char *line)
+{
+	unsigned long count;
+	char *endptr;
+
+	count = strtoul(line, &endptr, 10);
+	if (line == endptr || *endptr != ' ')
+		die("Invalid smaps count");
+
+	return (uint64_t)count << 10;
+}
+
+static void read_bonus_info(const char *tag, const char *line)
+{
+	uint64_t val;
+
+	val = read_smaps_count(&line[strlen(tag)]);
+	if (val)
+		print_bonus_info(tag, val);
+}
+
+static void count_process_smaps(unsigned pid, struct pstats *total)
+{
+	char path[64];
+	char line[256];
+	FILE *sms_file;
+	uint64_t vstart;
 	char perms[5];
 	char backing[128];
+	struct pstats count;
+
+	sprintf(path, "/proc/%u/smaps", pid);
+	sms_file = fopen(path, "r");
+	if (!sms_file)
+		die("fopen(/proc/PID/smaps) failed");
+
+	if (!fgets(line, sizeof(line), sms_file))
+		line[0] = '\0';
+
+	for (;;) {
+
+		if (!line[0])
+			break;
+
+		memset(&count, 0, sizeof(count));
+		parse_maps_line(line, &vstart, &count.vm, perms, backing);
+
+		if ( (!args.perms[0] || !memcmp(args.perms, perms, 3)) &&
+		     (!args.perms[3] || args.perms[3] == perms[3]) ) {
+
+			for (;;) {
+				line[0] = '\0';
+				if (!fgets(line, sizeof(line), sms_file) ||
+				    line[0] < 'A' || line[0] > 'Z')
+					break;
+
+				if (!memcmp(line, "Rss:", 4))
+					count.rss += read_smaps_count(&line[4]);
+				else if (!memcmp(line, "Pss:", 4))
+					count.wss += read_smaps_count(&line[4]);
+				else if (!memcmp(line, "Shared_Clean:", 13))
+					count.shr += read_smaps_count(&line[13]);
+				else if (!memcmp(line, "Shared_Dirty:", 13))
+					count.shr += read_smaps_count(&line[13]);
+				else if (!memcmp(line, "Private_Clean:", 14))
+					count.uss += read_smaps_count(&line[14]);
+				else if (!memcmp(line, "Private_Dirty:", 14))
+					count.uss += read_smaps_count(&line[14]);
+				else if (!memcmp(line, "Swap:", 5))
+					count.swp += read_smaps_count(&line[5]);
+				else if (!memcmp(line, "SwapPss:", 8))
+					count.wss += read_smaps_count(&line[8]);
+				else if (args.bonus) {
+					if (!memcmp(line, "LazyFree:", 9))
+						read_bonus_info("LazyFree:", line);
+					else if (!memcmp(line, "AnonHugePages:", 14))
+						read_bonus_info("AnonHugePages:", line);
+					else if (!memcmp(line, "ShmemHugePages:", 15))
+						read_bonus_info("ShmemHugePages:", line);
+					else if (!memcmp(line, "ShmemPmdMapped:", 15))
+						read_bonus_info("ShmemPmdMapped:", line);
+					else if (!memcmp(line, "FilePmdMapped:", 14))
+						read_bonus_info("FilePmdMapped:", line);
+					else if (!memcmp(line, "Shared_Hugetlb:", 15))
+						read_bonus_info("Shared_Hugetlb:", line);
+					else if (!memcmp(line, "Private_Hugetlb:", 16))
+						read_bonus_info("Private_Hugetlb:", line);
+				}
+			}
+
+			add_to_pstats(total, &count);
+
+			if (args.verbose) {
+				if (args.kibyte)
+					reduce_pstats_to_kib(&count);
+				print_verbose_counts(&count, perms, backing);
+			}
+
+		} else {
+
+			/* skip this mapping */
+			for (;;) {
+				line[0] = '\0';
+				if (!fgets(line, sizeof(line), sms_file) ||
+				    line[0] < 'A' || line[0] > 'Z')
+					break;
+			}
+
+		}
+	}
+
+	fclose(sms_file);
+}
+
+static void count_process_maps(unsigned pid, int kpc_fd, struct pstats *total)
+{
+	char path[64];
+	char line[256];
+	FILE *ms_file;
+	int pm_fd;
+	uint64_t vstart;
+	char perms[5];
+	char backing[128];
+	struct pstats count;
 	uint32_t pages;
 	int64_t pm_offset;
 	int64_t kpc_offset;
@@ -111,320 +489,191 @@ int main(int argc, char *argv[])
 	} data;
 	int loaded;
 
-	memset(&args, 0, sizeof(args));
+	sprintf(path, "/proc/%u/maps", pid);
+	ms_file = fopen(path, "r");
+	if (!ms_file)
+		die("fopen(/proc/PID/maps) failed");
+
+	sprintf(path, "/proc/%u/pagemap", pid);
+	pm_fd = open(path, O_RDONLY);
+	if (pm_fd < 0)
+		die("open(/proc/PID/pagemap) failed");
 
 	for (;;) {
-		static char sopt[] = "chkprsvwx";
-		static struct option lopt[] = {
-			{ "shr-count", no_argument, 0, 'c' },
-			{ "help",      no_argument, 0, 'h' },
-			{ "kibyte",    no_argument, 0, 'k' },
-			{ "private",   no_argument, 0, 'p' },
-			{ "read",      no_argument, 0, 'r' },
-			{ "shared",    no_argument, 0, 's' },
-			{ "verbose",   no_argument, 0, 'v' },
-			{ "write",     no_argument, 0, 'w' },
-			{ "execute",   no_argument, 0, 'x' },
-			{ NULL, 0, 0, 0 }
-		};
 
-		c = getopt_long(argc, argv, sopt, lopt, NULL);
-		if (c == -1)
+		line[0] = '\0';
+		if (!fgets(line, sizeof(line), ms_file))
 			break;
-			
-		switch (c) {
-		case 'c':
-			args.shr_count = 1;
-			break;
-		case 'h':
-			print_help_and_exit();
-			break;
-		case 'k':
-			args.kibyte = 1;
-			break;
-		case 'p':
-			args.p_private = 1;
-			break;
-		case 'r':
-			args.p_read = 1;
-			break;
-		case 's':
-			args.p_shared = 1;
-			break;
-		case 'v':
-			args.verbose = 1;
-			break;
-		case 'w':
-			args.p_write = 1;
-			break;
-		case 'x':
-			args.p_execute = 1;
-			break;
-		default:
-			die("Illegal option");
+
+		memset(&count, 0, sizeof(count));
+		parse_maps_line(line, &vstart, &count.vm, perms, backing);
+
+		if ( (!args.perms[0] || !memcmp(args.perms, perms, 3)) &&
+		     (!args.perms[3] || args.perms[3] == perms[3]) ) {
+
+			pages = count.vm / conf.page_size;
+			pm_offset = vstart / conf.page_size * sizeof(uint64_t);
+
+			if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
+				die("lseek(pm_offset) failed");
+
+			while (pages--) {
+
+				ssize_t res = read(pm_fd, data.b, sizeof(uint64_t));
+				if (!res)
+					/* happens for vsyscall & vectors */
+					continue;
+				if (res != sizeof(uint64_t))
+					die("read(pm_fd) failed");
+
+				/*
+				 * 63   Present in RAM
+				 * 62   In SWAP
+				 * 61   File-mapped or shared anonymous page
+				 * 56   Exclusively mapped
+				 * 55   PTE soft-dirty
+				 * 54-0 Page frame number (if 63 set)
+				 */
+
+				loaded = 0;
+				if (data.u & ((uint64_t)1<<63)) {
+					count.rss += conf.page_size;
+					loaded = 1;
+				}
+				if (data.u & ((uint64_t)1<<62)) {
+					count.swp += conf.page_size;
+					loaded = 1;
+				}
+
+				if (loaded) {
+					pfn = data.u & (uint64_t)0x3fffffffffffff;
+
+					/* kernel page count */
+					kpc_offset = pfn * sizeof(uint64_t);
+					if (lseek(kpc_fd, kpc_offset, SEEK_SET) != kpc_offset)
+						die("lseek(kpc_fd) failed");
+
+					if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
+						die("read(kpc_fd) failed");
+
+					if (args.shr_count)
+						print_share_count(data.u);
+
+					if (!data.u) {
+						/* should never be... */
+					} else if (data.u == 1) {
+						count.uss += conf.page_size;
+						count.wss += conf.page_size;
+					} else {
+						count.shr += conf.page_size;
+						count.wss += (conf.page_size + data.u/2) / data.u;
+					}
+				}
+			}
+
+			add_to_pstats(total, &count);
+
+			if (args.shr_count)
+				printf("\n");
+
+			if (args.verbose) {
+				if (args.kibyte)
+					reduce_pstats_to_kib(&count);
+				print_verbose_counts(&count, perms, backing);
+			}
 		}
 	}
-		
-	if ((argc - optind) < 1)
-		die("No PID specified. See --help.");
 
-	if (!args.p_read && !args.p_write && !args.p_execute)
-		args.p_read = args.p_write = args.p_execute = 1;
-	if (!args.p_private && !args.p_shared)
-		args.p_private = args.p_shared = 1;
+	close(pm_fd);
+	fclose(ms_file);
+}
 
-	/* Get kernel version using uname() */
-	/* Get kenel page size */
+int main(int argc, char *argv[])
+{
+	char path[64];
+	char cmdline[256];
+	unsigned *pid;
+	int kpc_fd;
+	FILE *cmd_file;
+	struct pstats total;
+	uint64_t wss_grand_total;
 
-	kpc_fd = open("/proc/kpagecount", O_RDONLY);
-	if (kpc_fd < 0)
-		die("open(/proc/kpagecount) failed");
+	parse_command_line(argc, argv);
+	get_system_config();
 
-	kpf_fd = open("/proc/kpageflags", O_RDONLY);
-	if (kpf_fd < 0)
-		die("open(/proc/kpageflags) failed");
+	if (args.maps) {
+		kpc_fd = open("/proc/kpagecount", O_RDONLY);
+		if (kpc_fd < 0)
+			die("open(/proc/kpagecount) failed");
+	}
 
 	if (!args.verbose)
-		printf("-PID--- -VM-------- -RSS------- -SWP------- -USS------- "
-		       "-SHR------- -WSS------- -Cmdline------- - - -\n");
+		print_heading();
 
 	wss_grand_total = 0;
 
-	while (optind < argc) {
+	for (pid = args.pids; *pid; ++pid) {
 
-		pid = strtoul(argv[optind++], NULL, 0);
-
-		sprintf(path, "/proc/%u/cmdline", pid);
-		ms_file = fopen(path, "r");
-		if (!ms_file) {
-			fprintf(stderr, "Failed to access /proc/%u/\n", pid);
+		sprintf(path, "/proc/%u/cmdline", *pid);
+		cmd_file = fopen(path, "r");
+		if (!cmd_file) {
+			fprintf(stderr, "Failed to access /proc/%u/\n", *pid);
 			continue;
 		}
 
-		cmdline[0] = '\0';
-		fgets(cmdline, sizeof(cmdline), ms_file);
-		fclose(ms_file);
+		if (!fgets(cmdline, sizeof(cmdline), cmd_file))
+			cmdline[0] = '\0';
+		fclose(cmd_file);
 
-		if (cmdline[0] == '\0')
-			continue;   /* kernel process */
+		if (cmdline[0] == '\0') {
+			if (!args.all)
+				continue;   /* kernel process */
 
-		sprintf(path, "/proc/%u/maps", pid);
-		ms_file = fopen(path, "r");
-		if (!ms_file)
-			die("fopen(/proc/PID/maps) failed");
+			sprintf(path, "/proc/%u/comm", *pid);
+			cmd_file = fopen(path, "r");
+			if (!cmd_file)
+				die("fopen(/proc/PID/comm) failed");
 
-		sprintf(path, "/proc/%u/pagemap", pid);
-		pm_fd = open(path, O_RDONLY);
-		if (pm_fd < 0)
-			die("open(/proc/PID/pagemap) failed");
-
-		if (args.verbose) {
-			printf("%7u %s\n", pid, cmdline);
-			printf("        -VM-------- -RSS------- -SWP------- -USS------- "
-			       "-SHR------- -WSS------- perm -pathname------- - - -\n");
-		}
-
-		vm_total = 0;
-		rss_total = 0;
-		swp_total = 0;
-		uss_total = 0;
-		shr_total = 0;
-		wss_total = 0;
-
-		for (;;) {
-
-			memset(line, 0, sizeof(line));
-			if (!fgets(line, sizeof(line), ms_file))
-				break;
-
-			/* vstart */
-			in = line;
-			end = NULL;
-			vstart = strtoul(in, &end, 16);
-			if (end && *end != '-')
-				die("missing '-'");
-
-			/* vend */
-			in = end + 1;
-			end = NULL;
-			vend = strtoul(in, &end, 16);
-			if (end && *end != ' ')
-				die("missing ' '");
-
-			/* perms */
-			in = end + 1;
-			memcpy(perms, in, 4);
-			perms[4] = 0;
-			in += 4;
-			if (*in != ' ')
-				die("missing ' '");
-
-			if (args.verbose) {
-
-				/* skip offset */
-				in += 1;
-				while (*in && *in != ' ')
-					++in;
-				if (*in != ' ')
-					die("missing ' '");
-
-				/* skip dev */
-				in += 1;
-				while (*in && *in != ' ')
-					++in;
-				if (*in != ' ')
-					die("missing ' '");
-
-				/* skip inode */
-				in += 1;
-				while (*in && *in != ' ')
-					++in;
-				if (*in != ' ')
-					die("missing ' '");
-
-				/* backing (pathname) */
-				while (*in == ' ')
-					++in;
-				end = backing;
-				while (*in != '\n' && *in != '\0')
-					*end++ = *in++;
-				*end = '\0';
+			if (!fgets(&cmdline[1], sizeof(cmdline) - 2, cmd_file)) {
+				cmdline[0] = '\0';
+			} else {
+				cmdline[0] = '[';
+				char *p = strchr(cmdline, '\n');
+				if (p)
+					*p = ']';
 			}
-
-			/* only vsyscall/vectors here (hopefully) */
-			if (vstart & ((uint64_t)1 << (CPU_SIZE-1)))
-				continue;
-
-			vm = vend - vstart;
-			pages = vm / PAGE_SIZE;
-			pm_offset = vstart / PAGE_SIZE * sizeof(uint64_t);
-			rss = 0;
-			swp = 0;
-			uss = 0;
-			shr = 0;
-			wss = 0;
-
-			if (( (args.p_read && perms[0] == 'r') ||
-			      (args.p_write && perms[1] == 'w') ||
-			      (args.p_execute && perms[2] == 'x') ) &&
-			    ( (args.p_private && perms[3] == 'p') ||
-			      (args.p_shared && perms[3] == 's') )) {
-
-				if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
-					die("lseek(pm_offset) failed");
-
-				while (pages) {
-
-					if (read(pm_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
-						die("read(pm_fd) failed");
-
-					/*
-					 * 63   Present in RAM
-					 * 62   In SWAP
-					 * 61   File-mapped or shared anonymous page
-					 * 56   Exclusively mapped
-					 * 55   PTE soft-dirty
-					 * 54-0 Page frame number (if 63 set)
-					 */
-
-					loaded = 0;
-					if (data.u & ((uint64_t)1<<63)) {
-						rss += PAGE_SIZE;
-						loaded = 1;
-					}
-					if (data.u & ((uint64_t)1<<62)) {
-						swp += PAGE_SIZE;
-						loaded = 1;
-					}
-
-					if (loaded) {
-						pfn = data.u & (uint64_t)0x3fffffffffffff;
-
-						/* kernel page count */
-						kpc_offset = pfn * sizeof(uint64_t);
-						if (lseek(kpc_fd, kpc_offset, SEEK_SET) != kpc_offset)
-							die("lseek(kpc_fd) failed");
-
-						if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
-							die("read(kpc_fd) failed");
-
-						if (args.shr_count)
-							printf("%" PRIu64 " ", data.u);
-
-						if (!data.u) {
-							/* should never be... */
-						} else if (data.u == 1) {
-							uss += PAGE_SIZE;
-							wss += PAGE_SIZE;
-						} else {
-							shr += PAGE_SIZE;
-							wss += (PAGE_SIZE + data.u/2) / data.u;
-						}
-					}
-
-					--pages;
-				}
-
-				vm_total += vm;
-				rss_total += rss;
-				swp_total += swp;
-				uss_total += uss;
-				shr_total += shr;
-				wss_total += wss;
-
-				if (args.kibyte) {
-					vm >>= 10;
-					rss >>= 10;
-					swp >>= 10;
-					uss >>= 10;
-					shr >>= 10;
-					wss >>= 10;
-				}
-
-				if (args.shr_count)
-					printf("\n");
-
-				if (args.verbose)
-					printf("        %11" PRIu64 " %11" PRIu64
-					       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-					       " %11" PRIu64 " %s %s\n",
-					       vm, rss, swp, uss, shr, wss, perms, backing);
-			}
-		}
-
-		wss_grand_total += wss_total;
-
-		if (args.kibyte) {
-			vm_total >>= 10;
-			rss_total >>= 10;
-			swp_total >>= 10;
-			uss_total >>= 10;
-			shr_total >>= 10;
-			wss_total >>= 10;
+			fclose(cmd_file);
 		}
 
 		if (args.verbose)
-			printf("   Tot: %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-			       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 "\n",
-			       vm_total, rss_total, swp_total, uss_total,
-			       shr_total, wss_total);
-		else
-			printf("%7u %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-			       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s\n",
-			       pid, vm_total, rss_total, swp_total, uss_total,
-			       shr_total, wss_total, cmdline);
+			print_verbose_heading(*pid, cmdline);
 
-		close(pm_fd);
-		fclose(ms_file);
+		memset(&total, 0, sizeof(total));
+
+		if (args.maps)
+			count_process_maps(*pid, kpc_fd, &total);
+		else
+			count_process_smaps(*pid, &total);
+
+		wss_grand_total += total.wss;
+
+		if (args.kibyte)
+			reduce_pstats_to_kib(&total);
+
+		if (args.verbose)
+			print_verbose_totals(&total);
+		else
+			print_totals(*pid, &total, cmdline);
 	}
 
 	if (args.kibyte)
 		wss_grand_total >>= 10;
 
-	printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
+	print_footer(wss_grand_total);
 
-	close(kpc_fd);
-	close(kpf_fd);
+	if (args.maps)
+		close(kpc_fd);
+	free(args.pids);
 
 	return EXIT_SUCCESS;
 }

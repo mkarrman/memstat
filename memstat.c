@@ -83,15 +83,27 @@ static void print_help_and_exit(void)
 "If neither or both of -p or -s is specifiead, both mapping kinds are included,\n"
 "othewise only the specified kind is included.\n"
 "\n"
-"Displayed metrics include:\n"
-" VM   Virtual Memory    - total size of all pages mapped.\n"
-" RSS  Resident Set Size - total size of pages in physical memory.\n"
-" SWP  Swap              - total size of pages in swap space.\n"
-" USS  Unique Set Size   - total size of pages with a reference count of one.\n"
-" SHR  Shared            - total size of pages shared with other processes.\n"
+"Displayed metrics (in normal smaps mode):\n"
+" VM   Virtual Memory    - total size of all memory mapped.\n"
+" RSS  Resident Set Size - sum of all smaps 'Rss' values.\n"
+" SWP  Swap              - sum of all smaps 'Swap' values.\n"
+" USS  Unique Set Size   - sum of all smaps 'Private_Clean' and 'Private_Dirty'\n"
+"                          values.\n"
+" SHR  Shared            - sum of all smaps 'Shared_Clean' and 'Shared_Dirty'\n"
+"                          values.\n"
+" WSS  Weighted Set Size - sum of all smaps 'Pss' and 'SwapPss' values\n"
+"                          (PSS = Proportional Set Size)."
+"\n"
+"Displayed metrics (in -m/--maps mode):\n"
+" VM   Virtual Memory    - total size of all memory mapped.\n"
+" RSS  Resident Set Size - total size of pages currently in physical memory.\n"
+" SWP  Swap              - total size of pages currently in swap space.\n"
+" USS  Unique Set Size   - total size of RSS and SWP pages with a reference\n"
+"                          count of one.\n"
+" SHR  Shared            - total size of RSS and SWP pages shared with other\n"
+"                          processes.\n"
 " WSS  Weighted Set Size - USS plus each SHR page divided by the number of\n"
-"                          referencing processes for that page. Sometimes\n"
-"                          called PSS - Proportional Set Size."
+"                          referencing processes for that page.\n"
 "\n"
 "Note that -s/--shared refers to explicitly shared mappings, e.g. those used\n"
 "by tmpfs, while the SHR value refers to all pages shared between processes\n"
@@ -593,7 +605,7 @@ int main(int argc, char *argv[])
 	char path[64];
 	char cmdline[256];
 	unsigned *pid;
-	int kpc_fd;
+	int kpc_fd = -1;
 	FILE *cmd_file;
 	struct pstats total;
 	uint64_t wss_grand_total;

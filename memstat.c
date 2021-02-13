@@ -35,10 +35,12 @@
 #define PMF_IN_SWAP        ((uint64_t)1 << 62)
 #define PMF_PFN            ((uint64_t)0x003fffffffffffff)
 
+#define MAX_EXCLUDES       16
 
 /* Non short-opt options */
 enum {
 	OPT_BONUS = 2,
+	OPT_EXCLUDE,
 	OPT_FLAGS,
 	OPT_MAPS
 };
@@ -58,6 +60,8 @@ static struct {
 	unsigned kibyte : 1;
 	unsigned maps : 1;
 	unsigned verbose : 1;
+	const char *exclude[MAX_EXCLUDES];
+	unsigned excl_len[MAX_EXCLUDES];
 	char perms[4];
 	unsigned *pids;
 } args;
@@ -103,6 +107,10 @@ static void print_help_and_exit(void)
 " -a --all         Include all processes (kernel too).\n"
 "    --bonus       Print additional info (if any) not included in summing.\n"
 "                  Values appear before the respective mapping in output.\n"
+"    --exclude PFX Exclude mappings with backing paths beginning with PFX.\n"
+"                  May be specified multiple times. Special value 'ANON' will\n"
+"                  exclude anonymous mappings and '?' will exclude all but\n"
+"                  anonymous mappings.\n"
 "    --flags       Print flags and sharing count for each page. Requires --maps.\n"
 "                  Values appear before the respective mapping in output.\n"
 " -g --general     Show general system information.\n"
@@ -133,7 +141,7 @@ static void print_help_and_exit(void)
 " SHR  Shared            - sum of all smaps 'Shared_Clean' and 'Shared_Dirty'\n"
 "                          values.\n"
 " WSS  Weighted Set Size - sum of all smaps 'Pss' and 'SwapPss' values\n"
-"                          (PSS = Proportional Set Size)."
+"                          (PSS = Proportional Set Size).\n"
 "\n"
 "Displayed metrics (in --maps mode):\n"
 " VM   Virtual Memory    - total size of all memory mapped.\n"
@@ -142,7 +150,7 @@ static void print_help_and_exit(void)
 " USS  Unique Set Size   - total size of RSS and SWP pages with a reference\n"
 "                          count of one.\n"
 " SHR  Shared            - total size of RSS and SWP pages shared with other\n"
-"                          processes.\n"
+"                          processes (ref count greater than one).\n"
 " WSS  Weighted Set Size - USS plus each SHR page divided by the number of\n"
 "                          referencing processes for that page.\n"
 "\n"
@@ -168,6 +176,7 @@ static void parse_command_line(int argc, char *argv[])
 	static struct option lopt[] = {
 		{ "all",       no_argument, 0, 'a' },
 		{ "bonus",     no_argument, 0, OPT_BONUS },
+		{ "exclude",   required_argument, 0, OPT_EXCLUDE },
 		{ "flags",     no_argument, 0, OPT_FLAGS },
 		{ "general",   no_argument, 0, 'g' },
 		{ "help",      no_argument, 0, 'h' },
@@ -181,6 +190,7 @@ static void parse_command_line(int argc, char *argv[])
 		{ "execute",   no_argument, 0, 'x' },
 		{ NULL, 0, 0, 0 }
 	};
+	int excludes = 0;
 	int pid_count;
 	unsigned *pid;
 	char *endptr;
@@ -199,6 +209,13 @@ static void parse_command_line(int argc, char *argv[])
 			break;
 		case OPT_BONUS:
 			args.bonus = 1;
+			break;
+		case OPT_EXCLUDE:
+			if (excludes >= MAX_EXCLUDES)
+				die("Too many --exclude");
+			args.exclude[excludes] = optarg;
+			args.excl_len[excludes] = strlen(optarg);
+			++excludes;
 			break;
 		case OPT_FLAGS:
 			args.flags = 1;
@@ -469,7 +486,7 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 	if (*in != ' ')
 		die("missing ' '");
 
-	if (args.verbose) {
+	if (args.verbose || args.excl_len[0]) {
 
 		/* skip offset */
 		in += 1;
@@ -500,6 +517,41 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 			*end++ = *in++;
 		*end = '\0';
 	}
+}
+
+static int included_mapping(const char *perms, const char *backing)
+{
+	unsigned i;
+	unsigned b_len;
+	unsigned e_len;
+
+	/* rwx perms set but not matching */
+	if (args.perms[0] && memcmp(args.perms, perms, 3))
+		return 0;
+
+	/* p or s perms set but not matching */
+	if (args.perms[3] && args.perms[3] != perms[3])
+		return 0;
+
+	/* backing matching excluded prefix */
+	b_len = strlen(backing);
+	for (i = 0; i < MAX_EXCLUDES; ++i) {
+		e_len = args.excl_len[i];
+
+		if (!e_len)
+			break;  /* No more exclude strings */
+
+		if (!b_len) {
+			if (!strcmp(args.exclude[i], "ANON"))
+				return 0;
+		} else if (b_len >= e_len) {
+			if (args.exclude[i][0] == '?' ||
+			    !memcmp(backing, args.exclude[i], e_len))
+				return 0;
+		}
+	}
+
+	return 1;
 }
 
 static void smaps_bonus_info(const char *tag, const char *line)
@@ -536,8 +588,7 @@ static void smaps_count_process(unsigned pid, struct pstats *total)
 		memset(&count, 0, sizeof(count));
 		parse_maps_line(line, &vstart, &count.vm, perms, backing);
 
-		if ( (!args.perms[0] || !memcmp(args.perms, perms, 3)) &&
-		     (!args.perms[3] || args.perms[3] == perms[3]) ) {
+		if (included_mapping(perms, backing)) {
 
 			for (;;) {
 				line[0] = '\0';
@@ -651,8 +702,7 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 		memset(&count, 0, sizeof(count));
 		parse_maps_line(line, &vstart, &count.vm, perms, backing);
 
-		if ( (!args.perms[0] || !memcmp(args.perms, perms, 3)) &&
-		     (!args.perms[3] || args.perms[3] == perms[3]) ) {
+		if (included_mapping(perms, backing)) {
 
 			counted = 0;
 			pm_offset = vstart / conf.page_size * sizeof(uint64_t);

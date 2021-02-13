@@ -13,6 +13,7 @@
  * GNU General Public License for more details.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -36,13 +37,15 @@
 #define PMF_PFN            ((uint64_t)0x003fffffffffffff)
 
 #define MAX_EXCLUDES       16
+#define MAX_PID_COUNT      1023
 
 /* Non short-opt options */
 enum {
 	OPT_BONUS = 2,
 	OPT_EXCLUDE,
 	OPT_FLAGS,
-	OPT_MAPS
+	OPT_MAPS,
+	OPT_SMAPS
 };
 
 /* process stats counters */
@@ -100,7 +103,7 @@ static void print_help_and_exit(void)
 
 "Process memory usage analysis tool\n"
 "\n"
-"Usage: memstat [OPTIONS] PID [PID ...]\n"
+"Usage: memstat [OPTIONS] [PID ...]\n"
 "\n"
 "Where OPTIONS are:\n"
 " -h --help        Show this help text and exit.\n"
@@ -120,19 +123,21 @@ static void print_help_and_exit(void)
 " -p --private     Include private mappings.\n"
 " -r --read        Include mappings with read permission.\n"
 " -s --shared      Include shared mappings.\n"
+"    --smaps       Calculate based on smaps proc file (this is the default).\n"
 " -v --verbose     Show detailed information for each process.\n"
 " -w --write       Include mappings with write permission.\n"
 " -x --execute     Include mappings with execute permission.\n"
 "\n"
 "PID are one or more process identifiers for running processes. Processes\n"
 "without cmdline info are skipped unless -a/-all is specified.\n"
+"If no PID is specified, all processes found under /proc is included.\n"
 "\n"
 "If neither of -r, -w or -x is specified, all permission combinations are\n"
 "included, otherwise all of those and only those specified must be set.\n"
 "If neither or both of -p or -s is specifiead, both mapping kinds are included,\n"
 "othewise only the specified kind is included.\n"
 "\n"
-"Displayed metrics (in normal smaps mode):\n"
+"Displayed metrics (in default --smaps mode):\n"
 " VM   Virtual Memory    - total size of all memory mapped.\n"
 " RSS  Resident Set Size - sum of all smaps 'Rss' values.\n"
 " SWP  Swap              - sum of all smaps 'Swap' values.\n"
@@ -154,12 +159,17 @@ static void print_help_and_exit(void)
 " WSS  Weighted Set Size - USS plus each SHR page divided by the number of\n"
 "                          referencing processes for that page.\n"
 "\n"
-"Note that -s/--shared refers to explicitly shared mappings, e.g. those used\n"
-"by tmpfs, while the SHR value refers to all pages shared between processes\n"
-"including both shared and private mappings. Private mappings are shared, e.g.\n"
-"for code when multiple copies of the same program is run or the same library\n"
-"is used by multiple programs.\n"
-
+"Notes:\n"
+"* Analyzing processes owned by other than the current user requires elevated\n"
+"  privileges and so does using the --maps option.\n"
+"* The option -s/--shared refers to explicitly shared mappings, e.g. those used\n"
+"  by tmpfs, while the SHR value refers to all pages shared between processes\n"
+"  including both shared and private mappings. Private mappings are shared, e.g.\n"
+"  for code when multiple copies of the same program is run or the same library\n"
+"  is used by multiple programs.\n"
+"* Mappings referring to reserved memory (e.g. reserved in device tree) will be\n"
+"  included in the analysis, even though it is normally not included in the\n"
+"  total memory as reported by 'free' and 'top' commands.\n"
 	);
 	exit(EXIT_SUCCESS);
 }
@@ -170,7 +180,7 @@ static void die(const char *msg)
 	exit(EXIT_FAILURE);
 }
 
-static void parse_command_line(int argc, char *argv[])
+static int parse_command_line(int argc, char *argv[])
 {
 	static char sopt[] = "aghkprsvwx";
 	static struct option lopt[] = {
@@ -185,15 +195,13 @@ static void parse_command_line(int argc, char *argv[])
 		{ "private",   no_argument, 0, 'p' },
 		{ "read",      no_argument, 0, 'r' },
 		{ "shared",    no_argument, 0, 's' },
+		{ "smaps",     no_argument, 0, OPT_SMAPS },
 		{ "verbose",   no_argument, 0, 'v' },
 		{ "write",     no_argument, 0, 'w' },
 		{ "execute",   no_argument, 0, 'x' },
 		{ NULL, 0, 0, 0 }
 	};
 	int excludes = 0;
-	int pid_count;
-	unsigned *pid;
-	char *endptr;
 	int c;
 
 	memcpy(args.perms, "---", 3);
@@ -247,6 +255,9 @@ static void parse_command_line(int argc, char *argv[])
 			else
 				args.perms[3] = 's';
 			break;
+		case OPT_SMAPS:
+			args.maps = 0;
+			break;
 		case 'v':
 			args.verbose = 1;
 			break;
@@ -267,22 +278,67 @@ static void parse_command_line(int argc, char *argv[])
 	if (args.flags && !args.maps)
 		die("--flags option only valid together with --maps");
 
-	pid_count = argc - optind;
-	if (pid_count < 1)
-		die("No PID specified. See --help.");
+	return optind;
+}
 
+static void parse_pids_from_cmdline(int argc, char *argv[], int optind)
+{
+	int pid_count;
+	unsigned *pid;
+	char *endptr;
+
+	pid_count = argc - optind;
 	args.pids = calloc(pid_count + 1, sizeof(*args.pids));
 	if (!args.pids)
 		die("Failed to allocate pids memory");
 
 	pid = args.pids;
 	while (optind < argc) {
-		*pid = strtoul(argv[optind], &endptr, 0);
+		*pid = strtoul(argv[optind], &endptr, 10);
 		if (!*pid || *endptr)
 			die("Invalid PID specified");
 		++pid;
 		++optind;
 	}
+}
+
+static void parse_pids_from_proc(void)
+{
+	DIR *dir;
+	struct dirent *dirent;
+	unsigned *pid;
+	char *endptr;
+	int i;
+
+	args.pids = calloc(MAX_PID_COUNT + 1, sizeof(*args.pids));
+	if (!args.pids)
+		die("Failed to allocate pids memory");
+
+	dir = opendir("/proc");
+	if (!dir)
+		die("Failed to open /proc");
+
+	pid = args.pids;
+	for (i = 0; i < MAX_PID_COUNT; ++i) {
+		errno = 0;
+		dirent = readdir(dir);
+		if (!dirent) {
+			if (errno)
+				die("Failed to read /proc");
+			break;
+		}
+
+		*pid = strtoul(dirent->d_name, &endptr, 10);
+		if (!*pid || *endptr)
+			continue;
+
+		++pid;
+	}
+
+	if (i >= MAX_PID_COUNT)
+		fprintf(stderr, "Reached max PID count (%d)\n", i);
+
+	closedir(dir);
 }
 
 static uint64_t read_proc_count(const char *line)
@@ -784,6 +840,7 @@ int main(int argc, char *argv[])
 {
 	char path[64];
 	char cmdline[256];
+	int first_pid;
 	unsigned *pid;
 	int kpc_fd = -1;
 	int kpf_fd = -1;
@@ -791,7 +848,12 @@ int main(int argc, char *argv[])
 	struct pstats total;
 	uint64_t wss_grand_total;
 
-	parse_command_line(argc, argv);
+	first_pid = parse_command_line(argc, argv);
+	if (first_pid < argc)
+		parse_pids_from_cmdline(argc, argv, first_pid);
+	else
+		parse_pids_from_proc();
+
 	get_system_config();
 	get_system_meminfo();
 

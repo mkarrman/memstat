@@ -25,6 +25,24 @@
 #include <unistd.h>
 
 
+/* kernel page flags */
+#define KPF_COMPOUND_HEAD  ((uint64_t)1 << 15)        /* Linux 2.6.31 */
+#define KPF_HUGE           ((uint64_t)1 << 17)        /* Linux 2.6.31 */
+#define KPF_THP            ((uint64_t)1 << 22)        /* Linux 3.4 */
+
+/* page map bit fields */
+#define PMF_IN_RAM         ((uint64_t)1 << 63)
+#define PMF_IN_SWAP        ((uint64_t)1 << 62)
+#define PMF_PFN            ((uint64_t)0x003fffffffffffff)
+
+
+/* Non short-opt options */
+enum {
+	OPT_BONUS = 2,
+	OPT_FLAGS,
+	OPT_MAPS
+};
+
 /* process stats counters */
 struct pstats {
 	uint64_t vm, rss, swp, uss, shr, wss;
@@ -35,9 +53,10 @@ struct pstats {
 static struct {
 	unsigned all : 1;
 	unsigned bonus : 1;
+	unsigned flags : 1;
+	unsigned general : 1;
 	unsigned kibyte : 1;
 	unsigned maps : 1;
-	unsigned shr_count : 1;
 	unsigned verbose : 1;
 	char perms[4];
 	unsigned *pids;
@@ -48,6 +67,27 @@ static struct {
 	unsigned page_size;
 	//unsigned kernel_ver;
 } conf;
+
+/* system memory info */
+static struct {
+	uint64_t mem_total;
+	uint64_t mem_free;
+	uint64_t mem_avail;
+	uint64_t shared;
+	uint64_t buffers;
+	uint64_t cached;
+	uint64_t swap_cached;
+	uint64_t swap_total;
+	uint64_t swap_free;
+	uint64_t page_tables;
+	uint64_t k_stacks;
+	uint64_t k_slabs;
+	uint64_t k_reclaimable;
+	uint64_t huge_page_size;
+} meminfo;
+
+/* Text line buffer */
+static char line[512];
 
 
 static void print_help_and_exit(void)
@@ -61,12 +101,13 @@ static void print_help_and_exit(void)
 "Where OPTIONS are:\n"
 " -h --help        Show this help text and exit.\n"
 " -a --all         Include all processes (kernel too).\n"
-" -b --bonus       Print additional info (if any) not included in summing.\n"
+"    --bonus       Print additional info (if any) not included in summing.\n"
 "                  Values appear before the respective mapping in output.\n"
-" -c --shr-count   Print the sharing count of each page. Requires -m/--maps.\n"
+"    --flags       Print flags and sharing count for each page. Requires --maps.\n"
 "                  Values appear before the respective mapping in output.\n"
+" -g --general     Show general system information.\n"
 " -k --kibyte      Display values in KiB instead of bytes.\n"
-" -m --maps        Calculate based on maps, pagemap and kpagecount instead of\n"
+"    --maps        Calculate based on maps, pagemap and kpagecount instead of\n"
 "                  smaps proc file (slower).\n"
 " -p --private     Include private mappings.\n"
 " -r --read        Include mappings with read permission.\n"
@@ -94,7 +135,7 @@ static void print_help_and_exit(void)
 " WSS  Weighted Set Size - sum of all smaps 'Pss' and 'SwapPss' values\n"
 "                          (PSS = Proportional Set Size)."
 "\n"
-"Displayed metrics (in -m/--maps mode):\n"
+"Displayed metrics (in --maps mode):\n"
 " VM   Virtual Memory    - total size of all memory mapped.\n"
 " RSS  Resident Set Size - total size of pages currently in physical memory.\n"
 " SWP  Swap              - total size of pages currently in swap space.\n"
@@ -123,14 +164,15 @@ static void die(const char *msg)
 
 static void parse_command_line(int argc, char *argv[])
 {
-	static char sopt[] = "abchkmprsvwx";
+	static char sopt[] = "aghkprsvwx";
 	static struct option lopt[] = {
 		{ "all",       no_argument, 0, 'a' },
-		{ "bonus",     no_argument, 0, 'b' },
-		{ "shr-count", no_argument, 0, 'c' },
+		{ "bonus",     no_argument, 0, OPT_BONUS },
+		{ "flags",     no_argument, 0, OPT_FLAGS },
+		{ "general",   no_argument, 0, 'g' },
 		{ "help",      no_argument, 0, 'h' },
 		{ "kibyte",    no_argument, 0, 'k' },
-		{ "maps",      no_argument, 0, 'm' },
+		{ "maps",      no_argument, 0, OPT_MAPS },
 		{ "private",   no_argument, 0, 'p' },
 		{ "read",      no_argument, 0, 'r' },
 		{ "shared",    no_argument, 0, 's' },
@@ -155,11 +197,14 @@ static void parse_command_line(int argc, char *argv[])
 		case 'a':
 			args.all = 1;
 			break;
-		case 'b':
+		case OPT_BONUS:
 			args.bonus = 1;
 			break;
-		case 'c':
-			args.shr_count = 1;
+		case OPT_FLAGS:
+			args.flags = 1;
+			break;
+		case 'g':
+			args.general = 1;
 			break;
 		case 'h':
 			print_help_and_exit();
@@ -167,7 +212,7 @@ static void parse_command_line(int argc, char *argv[])
 		case 'k':
 			args.kibyte = 1;
 			break;
-		case 'm':
+		case OPT_MAPS:
 			args.maps = 1;
 			break;
 		case 'p':
@@ -195,15 +240,15 @@ static void parse_command_line(int argc, char *argv[])
 			args.perms[2] = 'x';
 			break;
 		default:
-			die("Illegal option");
+			exit(EXIT_FAILURE);
 		}
 	}
 
 	if (!memcmp(args.perms, "---", 3))
 		args.perms[0] = '\0';
 
-	if (args.shr_count && !args.maps)
-		die("-c option requires -m too");
+	if (args.flags && !args.maps)
+		die("--flags option only valid together with --maps");
 
 	pid_count = argc - optind;
 	if (pid_count < 1)
@@ -223,6 +268,18 @@ static void parse_command_line(int argc, char *argv[])
 	}
 }
 
+static uint64_t read_proc_count(const char *line)
+{
+	unsigned long count;
+	char *endptr;
+
+	count = strtoul(line, &endptr, 10);
+	if (line == endptr || *endptr != ' ')
+		die("Invalid proc count");
+
+	return (uint64_t)count << 10;
+}
+
 static void get_system_config(void)
 {
 	long conf_val;
@@ -233,6 +290,79 @@ static void get_system_config(void)
 	conf.page_size = conf_val;
 
 	/* Get kernel version using uname() */
+}
+
+static void get_system_meminfo(void)
+{
+	FILE *meminfo_file;
+
+	meminfo_file = fopen("/proc/meminfo", "r");
+	if (!meminfo_file)
+		die("fopen(/proc/meminfo failed");
+
+	line[0] = '\0';
+	while (fgets(line, sizeof(line), meminfo_file)) {
+		if (!memcmp(line, "MemTotal:", 9))
+			meminfo.mem_total = read_proc_count(&line[9]);
+		else if (!memcmp(line, "MemFree:", 8))
+			meminfo.mem_free = read_proc_count(&line[8]);
+		else if (!memcmp(line, "MemAvailable:", 13))
+			meminfo.mem_avail = read_proc_count(&line[13]);
+		else if (!memcmp(line, "Shmem:", 6))
+			meminfo.shared = read_proc_count(&line[6]);
+		else if (!memcmp(line, "Buffers:", 8))
+			meminfo.buffers = read_proc_count(&line[8]);
+		else if (!memcmp(line, "Cached:", 7))
+			meminfo.cached = read_proc_count(&line[7]);
+		else if (!memcmp(line, "SwapCached:", 11))
+			meminfo.swap_cached = read_proc_count(&line[11]);
+		else if (!memcmp(line, "SwapTotal:", 10))
+			meminfo.swap_total = read_proc_count(&line[10]);
+		else if (!memcmp(line, "SwapFree:", 9))
+			meminfo.swap_free = read_proc_count(&line[9]);
+		else if (!memcmp(line, "PageTables:", 11))
+			meminfo.page_tables = read_proc_count(&line[11]);
+		else if (!memcmp(line, "KernelStack:", 12))
+			meminfo.k_stacks = read_proc_count(&line[12]);
+		else if (!memcmp(line, "Slab:", 5))
+			meminfo.k_slabs = read_proc_count(&line[5]);
+		else if (!memcmp(line, "KReclaimable:", 13))
+			meminfo.k_reclaimable = read_proc_count(&line[13]);
+		else if (!memcmp(line, "Hugepagesize:", 13))
+			meminfo.huge_page_size = read_proc_count(&line[13]);
+		line[0] = '\0';
+	}
+
+	fclose(meminfo_file);
+}
+
+static void print_general_info(void)
+{
+	uint64_t used;
+
+	used = meminfo.mem_total - meminfo.mem_free -
+	       meminfo.buffers - meminfo.cached - meminfo.swap_cached;
+
+	printf("      -total----- -used------ -free------ -shared----"
+	       " -buffers--- -cached---- -available-\n"
+	       "Mem:  %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %11" PRIu64
+	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 "\n",
+	       meminfo.mem_total, used, meminfo.mem_free, meminfo.shared,
+	       meminfo.buffers, meminfo.cached, meminfo.mem_avail);
+	if (meminfo.swap_total) {
+		printf("Swap: %1" PRIu64 " %11" PRIu64 "            "
+		       "                         %11" PRIu64 "\n",
+		       meminfo.swap_total, meminfo.swap_free, meminfo.swap_cached);
+	}
+	printf("\n");
+	printf("Page tables:        %11" PRIu64 "\n", meminfo.page_tables);
+	printf("Kernel stacks:      %11" PRIu64 "\n", meminfo.k_stacks);
+	printf("Kernel slabs:       %11" PRIu64 "\n", meminfo.k_slabs);
+	printf("Kernel reclaimable: %11" PRIu64 "\n", meminfo.k_reclaimable);
+	printf("\n");
+	printf("Page size:          %11u\n", conf.page_size);
+	printf("Huge page size:     %11" PRIu64 "\n", meminfo.huge_page_size);
+	printf("\n");
 }
 
 static void print_heading(void)
@@ -248,12 +378,17 @@ static void print_verbose_heading(unsigned pid, const char *cmdline)
 	       "-SHR------- -WSS------- perm -pathname------- - - -\n");
 }
 
-static void print_share_count(unsigned count)
+static void print_maps_flags(uint64_t kpf, unsigned kpc)
 {
-	printf("%u ", count);
+	printf("(0x%016" PRIx64 ", %u)\n", kpf, kpc);
 }
 
-static void print_bonus_info(const char *tag, uint64_t val)
+static void print_maps_bonus_info(const char *tag)
+{
+	printf("- %s\n", tag);
+}
+
+static void print_smaps_bonus_info(const char *tag, uint64_t val)
 {
 	printf("- %-17s%10" PRIu64 "\n", tag, val);
 }
@@ -367,31 +502,18 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 	}
 }
 
-static uint64_t read_smaps_count(const char *line)
-{
-	unsigned long count;
-	char *endptr;
-
-	count = strtoul(line, &endptr, 10);
-	if (line == endptr || *endptr != ' ')
-		die("Invalid smaps count");
-
-	return (uint64_t)count << 10;
-}
-
-static void read_bonus_info(const char *tag, const char *line)
+static void smaps_bonus_info(const char *tag, const char *line)
 {
 	uint64_t val;
 
-	val = read_smaps_count(&line[strlen(tag)]);
+	val = read_proc_count(&line[strlen(tag)]);
 	if (val)
-		print_bonus_info(tag, val);
+		print_smaps_bonus_info(tag, val);
 }
 
-static void count_process_smaps(unsigned pid, struct pstats *total)
+static void smaps_count_process(unsigned pid, struct pstats *total)
 {
 	char path[64];
-	char line[256];
 	FILE *sms_file;
 	uint64_t vstart;
 	char perms[5];
@@ -424,36 +546,36 @@ static void count_process_smaps(unsigned pid, struct pstats *total)
 					break;
 
 				if (!memcmp(line, "Rss:", 4))
-					count.rss += read_smaps_count(&line[4]);
+					count.rss += read_proc_count(&line[4]);
 				else if (!memcmp(line, "Pss:", 4))
-					count.wss += read_smaps_count(&line[4]);
+					count.wss += read_proc_count(&line[4]);
 				else if (!memcmp(line, "Shared_Clean:", 13))
-					count.shr += read_smaps_count(&line[13]);
+					count.shr += read_proc_count(&line[13]);
 				else if (!memcmp(line, "Shared_Dirty:", 13))
-					count.shr += read_smaps_count(&line[13]);
+					count.shr += read_proc_count(&line[13]);
 				else if (!memcmp(line, "Private_Clean:", 14))
-					count.uss += read_smaps_count(&line[14]);
+					count.uss += read_proc_count(&line[14]);
 				else if (!memcmp(line, "Private_Dirty:", 14))
-					count.uss += read_smaps_count(&line[14]);
+					count.uss += read_proc_count(&line[14]);
 				else if (!memcmp(line, "Swap:", 5))
-					count.swp += read_smaps_count(&line[5]);
+					count.swp += read_proc_count(&line[5]);
 				else if (!memcmp(line, "SwapPss:", 8))
-					count.wss += read_smaps_count(&line[8]);
+					count.wss += read_proc_count(&line[8]);
 				else if (args.bonus) {
 					if (!memcmp(line, "LazyFree:", 9))
-						read_bonus_info("LazyFree:", line);
+						smaps_bonus_info("LazyFree:", line);
 					else if (!memcmp(line, "AnonHugePages:", 14))
-						read_bonus_info("AnonHugePages:", line);
+						smaps_bonus_info("AnonHugePages:", line);
 					else if (!memcmp(line, "ShmemHugePages:", 15))
-						read_bonus_info("ShmemHugePages:", line);
+						smaps_bonus_info("ShmemHugePages:", line);
 					else if (!memcmp(line, "ShmemPmdMapped:", 15))
-						read_bonus_info("ShmemPmdMapped:", line);
+						smaps_bonus_info("ShmemPmdMapped:", line);
 					else if (!memcmp(line, "FilePmdMapped:", 14))
-						read_bonus_info("FilePmdMapped:", line);
+						smaps_bonus_info("FilePmdMapped:", line);
 					else if (!memcmp(line, "Shared_Hugetlb:", 15))
-						read_bonus_info("Shared_Hugetlb:", line);
+						smaps_bonus_info("Shared_Hugetlb:", line);
 					else if (!memcmp(line, "Private_Hugetlb:", 16))
-						read_bonus_info("Private_Hugetlb:", line);
+						smaps_bonus_info("Private_Hugetlb:", line);
 				}
 			}
 
@@ -481,25 +603,34 @@ static void count_process_smaps(unsigned pid, struct pstats *total)
 	fclose(sms_file);
 }
 
-static void count_process_maps(unsigned pid, int kpc_fd, struct pstats *total)
+static void maps_bonus_info(uint64_t kpf)
+{
+	if (kpf & KPF_COMPOUND_HEAD) {
+		if (kpf & KPF_HUGE)
+			print_maps_bonus_info("HugeTLB page");
+		else if (kpf & KPF_THP)
+			print_maps_bonus_info("Transparent huge page");
+	}
+}
+
+static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
+                               struct pstats *total)
 {
 	char path[64];
-	char line[256];
 	FILE *ms_file;
 	int pm_fd;
 	uint64_t vstart;
 	char perms[5];
 	char backing[128];
 	struct pstats count;
-	uint32_t pages;
+	uint64_t counted;
 	int64_t pm_offset;
-	int64_t kpc_offset;
+	int64_t kpcf_offset;
 	uint64_t pfn;
 	union {
 		uint64_t u;
 		uint8_t b[sizeof(uint64_t)];
-	} data;
-	int loaded;
+	} pm, kpf, kpc;
 
 	sprintf(path, "/proc/%u/maps", pid);
 	ms_file = fopen(path, "r");
@@ -523,70 +654,69 @@ static void count_process_maps(unsigned pid, int kpc_fd, struct pstats *total)
 		if ( (!args.perms[0] || !memcmp(args.perms, perms, 3)) &&
 		     (!args.perms[3] || args.perms[3] == perms[3]) ) {
 
-			pages = count.vm / conf.page_size;
+			counted = 0;
 			pm_offset = vstart / conf.page_size * sizeof(uint64_t);
-
 			if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
-				die("lseek(pm_offset) failed");
+				die("lseek(pm_fd) failed");
 
-			while (pages--) {
+			while (counted < count.vm) {
 
-				ssize_t res = read(pm_fd, data.b, sizeof(uint64_t));
-				if (!res)
+				ssize_t res = read(pm_fd, pm.b, sizeof(uint64_t));
+				if (!res) {
 					/* happens for vsyscall & vectors */
+					counted += conf.page_size;
 					continue;
+				}
 				if (res != sizeof(uint64_t))
 					die("read(pm_fd) failed");
 
-				/*
-				 * 63   Present in RAM
-				 * 62   In SWAP
-				 * 61   File-mapped or shared anonymous page
-				 * 56   Exclusively mapped
-				 * 55   PTE soft-dirty
-				 * 54-0 Page frame number (if 63 set)
-				 */
+				if (pm.u & PMF_IN_RAM) {
 
-				loaded = 0;
-				if (data.u & ((uint64_t)1<<63)) {
+					pfn = pm.u & PMF_PFN;
+					kpcf_offset = pfn * sizeof(uint64_t);
+
+					/* kernel page flags */
+					if (lseek(kpf_fd, kpcf_offset, SEEK_SET) != kpcf_offset)
+						die("lseek(kpf_fd) failed");
+
+					if (read(kpf_fd, kpf.b, sizeof(uint64_t)) != sizeof(uint64_t))
+						die("read(kpf_fd) failed");
+
+					if (args.bonus)
+						maps_bonus_info(kpf.u);
+
 					count.rss += conf.page_size;
-					loaded = 1;
-				}
-				if (data.u & ((uint64_t)1<<62)) {
-					count.swp += conf.page_size;
-					loaded = 1;
-				}
-
-				if (loaded) {
-					pfn = data.u & (uint64_t)0x3fffffffffffff;
 
 					/* kernel page count */
-					kpc_offset = pfn * sizeof(uint64_t);
-					if (lseek(kpc_fd, kpc_offset, SEEK_SET) != kpc_offset)
+					if (lseek(kpc_fd, kpcf_offset, SEEK_SET) != kpcf_offset)
 						die("lseek(kpc_fd) failed");
 
-					if (read(kpc_fd, data.b, sizeof(uint64_t)) != sizeof(uint64_t))
+					if (read(kpc_fd, kpc.b, sizeof(uint64_t)) != sizeof(uint64_t))
 						die("read(kpc_fd) failed");
 
-					if (args.shr_count)
-						print_share_count(data.u);
+					if (args.flags)
+						print_maps_flags(kpf.u, kpc.u);
 
-					if (!data.u) {
+					if (!kpc.u) {
 						/* should never be... */
-					} else if (data.u == 1) {
+					} else if (kpc.u == 1) {
 						count.uss += conf.page_size;
 						count.wss += conf.page_size;
 					} else {
 						count.shr += conf.page_size;
-						count.wss += (conf.page_size + data.u/2) / data.u;
+						count.wss += (conf.page_size + kpc.u/2) / kpc.u;
 					}
+
+				} else if (pm.u & PMF_IN_SWAP) {
+
+					count.swp += conf.page_size;
+
 				}
+
+				counted += conf.page_size;
 			}
 
 			add_to_pstats(total, &count);
-
-			if (args.shr_count)
-				printf("\n");
 
 			if (args.verbose) {
 				if (args.kibyte)
@@ -606,17 +736,26 @@ int main(int argc, char *argv[])
 	char cmdline[256];
 	unsigned *pid;
 	int kpc_fd = -1;
+	int kpf_fd = -1;
 	FILE *cmd_file;
 	struct pstats total;
 	uint64_t wss_grand_total;
 
 	parse_command_line(argc, argv);
 	get_system_config();
+	get_system_meminfo();
+
+	if (args.general)
+		print_general_info();
 
 	if (args.maps) {
 		kpc_fd = open("/proc/kpagecount", O_RDONLY);
 		if (kpc_fd < 0)
 			die("open(/proc/kpagecount) failed");
+
+		kpf_fd = open("/proc/kpageflags", O_RDONLY);
+		if (kpf_fd < 0)
+			die("open(/proc/kpageflags) failed");
 	}
 
 	if (!args.verbose)
@@ -663,9 +802,9 @@ int main(int argc, char *argv[])
 		memset(&total, 0, sizeof(total));
 
 		if (args.maps)
-			count_process_maps(*pid, kpc_fd, &total);
+			maps_count_process(*pid, kpc_fd, kpf_fd, &total);
 		else
-			count_process_smaps(*pid, &total);
+			smaps_count_process(*pid, &total);
 
 		wss_grand_total += total.wss;
 
@@ -683,8 +822,10 @@ int main(int argc, char *argv[])
 
 	print_footer(wss_grand_total);
 
-	if (args.maps)
+	if (args.maps) {
+		close(kpf_fd);
 		close(kpc_fd);
+	}
 	free(args.pids);
 
 	return EXIT_SUCCESS;

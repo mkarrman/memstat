@@ -43,7 +43,6 @@
 enum {
 	OPT_BONUS = 2,
 	OPT_EXCLUDE,
-	OPT_FLAGS,
 	OPT_MAPS,
 	OPT_SMAPS
 };
@@ -58,7 +57,6 @@ struct pstats {
 static struct {
 	unsigned all : 1;
 	unsigned bonus : 1;
-	unsigned flags : 1;
 	unsigned general : 1;
 	unsigned kibyte : 1;
 	unsigned maps : 1;
@@ -109,13 +107,12 @@ static void print_help_and_exit(void)
 " -h --help        Show this help text and exit.\n"
 " -a --all         Include all processes (kernel too).\n"
 "    --bonus       Print additional info (if any) not included in summing.\n"
+"                  The information differs depending on mode (--smaps/--maps).\n"
 "                  Values appear before the respective mapping in output.\n"
 "    --exclude PFX Exclude mappings with backing paths beginning with PFX.\n"
 "                  May be specified multiple times. Special value 'ANON' will\n"
 "                  exclude anonymous mappings and '?' will exclude all but\n"
 "                  anonymous mappings.\n"
-"    --flags       Print flags and sharing count for each page. Requires --maps.\n"
-"                  Values appear before the respective mapping in output.\n"
 " -g --general     Show general system information.\n"
 " -k --kibyte      Display values in KiB instead of bytes.\n"
 "    --maps        Calculate based on maps, pagemap and kpagecount instead of\n"
@@ -187,7 +184,6 @@ static int parse_command_line(int argc, char *argv[])
 		{ "all",       no_argument, 0, 'a' },
 		{ "bonus",     no_argument, 0, OPT_BONUS },
 		{ "exclude",   required_argument, 0, OPT_EXCLUDE },
-		{ "flags",     no_argument, 0, OPT_FLAGS },
 		{ "general",   no_argument, 0, 'g' },
 		{ "help",      no_argument, 0, 'h' },
 		{ "kibyte",    no_argument, 0, 'k' },
@@ -224,9 +220,6 @@ static int parse_command_line(int argc, char *argv[])
 			args.exclude[excludes] = optarg;
 			args.excl_len[excludes] = strlen(optarg);
 			++excludes;
-			break;
-		case OPT_FLAGS:
-			args.flags = 1;
 			break;
 		case 'g':
 			args.general = 1;
@@ -274,9 +267,6 @@ static int parse_command_line(int argc, char *argv[])
 
 	if (!memcmp(args.perms, "---", 3))
 		args.perms[0] = '\0';
-
-	if (args.flags && !args.maps)
-		die("--flags option only valid together with --maps");
 
 	return optind;
 }
@@ -451,14 +441,10 @@ static void print_verbose_heading(unsigned pid, const char *cmdline)
 	       "-SHR------- -WSS------- perm -pathname------- - - -\n");
 }
 
-static void print_maps_flags(uint64_t kpf, unsigned kpc)
+static void print_maps_bonus_info(uint64_t pfn, uint64_t kpf, unsigned kpc)
 {
-	printf("(0x%016" PRIx64 ", %u)\n", kpf, kpc);
-}
-
-static void print_maps_bonus_info(const char *tag)
-{
-	printf("- %s\n", tag);
+	printf("(phys:0x%016" PRIx64 ", flags:0x%016" PRIx64 ", refs:%u)\n",
+	       pfn * conf.page_size, kpf, kpc);
 }
 
 static void print_smaps_bonus_info(const char *tag, uint64_t val)
@@ -710,16 +696,6 @@ static void smaps_count_process(unsigned pid, struct pstats *total)
 	fclose(sms_file);
 }
 
-static void maps_bonus_info(uint64_t kpf)
-{
-	if (kpf & KPF_COMPOUND_HEAD) {
-		if (kpf & KPF_HUGE)
-			print_maps_bonus_info("HugeTLB page");
-		else if (kpf & KPF_THP)
-			print_maps_bonus_info("Transparent huge page");
-	}
-}
-
 static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
                                struct pstats *total)
 {
@@ -788,9 +764,6 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 					if (read(kpf_fd, kpf.b, sizeof(uint64_t)) != sizeof(uint64_t))
 						die("read(kpf_fd) failed");
 
-					if (args.bonus)
-						maps_bonus_info(kpf.u);
-
 					count.rss += conf.page_size;
 
 					/* kernel page count */
@@ -800,8 +773,8 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 					if (read(kpc_fd, kpc.b, sizeof(uint64_t)) != sizeof(uint64_t))
 						die("read(kpc_fd) failed");
 
-					if (args.flags)
-						print_maps_flags(kpf.u, kpc.u);
+					if (args.bonus)
+						print_maps_bonus_info(pfn, kpf.u, kpc.u);
 
 					if (!kpc.u) {
 						/* should never be... */

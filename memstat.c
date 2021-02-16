@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,9 +172,17 @@ static void print_help_and_exit(void)
 	exit(EXIT_SUCCESS);
 }
 
-static void die(const char *msg)
+__attribute__ ((format (printf, 1, 2)))
+static void die(const char *fmt, ...)
 {
-	fprintf(stderr, "ERROR: %s\n", msg);
+	va_list ap;
+
+	fprintf(stderr, "ERROR: ");
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fprintf(stderr, "\n");
+
 	exit(EXIT_FAILURE);
 }
 
@@ -216,7 +225,7 @@ static int parse_command_line(int argc, char *argv[])
 			break;
 		case OPT_EXCLUDE:
 			if (excludes >= MAX_EXCLUDES)
-				die("Too many --exclude");
+				die("Too many --exclude, max=%u", MAX_EXCLUDES);
 			args.exclude[excludes] = optarg;
 			args.excl_len[excludes] = strlen(optarg);
 			++excludes;
@@ -286,7 +295,7 @@ static void parse_pids_from_cmdline(int argc, char *argv[], int optind)
 	while (optind < argc) {
 		*pid = strtoul(argv[optind], &endptr, 10);
 		if (!*pid || *endptr)
-			die("Invalid PID specified");
+			die("Invalid PID specified: '%s'", argv[optind]);
 		++pid;
 		++optind;
 	}
@@ -306,7 +315,7 @@ static void parse_pids_from_proc(void)
 
 	dir = opendir("/proc");
 	if (!dir)
-		die("Failed to open /proc");
+		die("Failed to open /proc (%s)", strerror(errno));
 
 	pid = args.pids;
 	for (i = 0; i < MAX_PID_COUNT; ++i) {
@@ -314,7 +323,7 @@ static void parse_pids_from_proc(void)
 		dirent = readdir(dir);
 		if (!dirent) {
 			if (errno)
-				die("Failed to read /proc");
+				die("Failed to read /proc (%s)", strerror(errno));
 			break;
 		}
 
@@ -326,7 +335,7 @@ static void parse_pids_from_proc(void)
 	}
 
 	if (i >= MAX_PID_COUNT)
-		fprintf(stderr, "Reached max PID count (%d)\n", i);
+		fprintf(stderr, "Reached max PID count (%d)\n", MAX_PID_COUNT);
 
 	closedir(dir);
 }
@@ -338,7 +347,7 @@ static uint64_t read_proc_count(const char *line)
 
 	count = strtoul(line, &endptr, 10);
 	if (line == endptr || *endptr != ' ')
-		die("Invalid proc count");
+		die("Invalid proc count '%s'", line);
 
 	return (uint64_t)count << 10;
 }
@@ -349,7 +358,7 @@ static void get_system_config(void)
 
 	conf_val = sysconf(_SC_PAGE_SIZE);
 	if (conf_val < 0)
-		die("sysconf(_SC_PAGE_SIZE) failed");
+		die("sysconf(_SC_PAGE_SIZE) failed (%s)", strerror(errno));
 	conf.page_size = conf_val;
 
 	/* Get kernel version using uname() */
@@ -361,7 +370,7 @@ static void get_system_meminfo(void)
 
 	meminfo_file = fopen("/proc/meminfo", "r");
 	if (!meminfo_file)
-		die("fopen(/proc/meminfo failed");
+		die("fopen(/proc/meminfo failed (%s)", strerror(errno));
 
 	line[0] = '\0';
 	while (fgets(line, sizeof(line), meminfo_file)) {
@@ -512,13 +521,13 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 	in = line;
 	*vstart = strtoul(in, &end, 16);
 	if (end && *end != '-')
-		die("missing '-'");
+		die("missing '-' in '%s'", line);
 
 	/* vend */
 	in = end + 1;
 	*vsize = strtoul(in, &end, 16) - *vstart;
 	if (end && *end != ' ')
-		die("missing ' '");
+		die("missing ' ' in '%s'", line);
 
 	/* perms */
 	in = end + 1;
@@ -526,7 +535,7 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 	perms[4] = 0;
 	in += 4;
 	if (*in != ' ')
-		die("missing ' '");
+		die("missing ' ' in '%s'", line);
 
 	if (args.verbose || args.excl_len[0]) {
 
@@ -535,21 +544,21 @@ static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
 		while (*in && *in != ' ')
 			++in;
 		if (*in != ' ')
-			die("missing ' '");
+			die("missing ' ' in '%s'", line);
 
 		/* skip dev */
 		in += 1;
 		while (*in && *in != ' ')
 			++in;
 		if (*in != ' ')
-			die("missing ' '");
+			die("missing ' ' in '%s'", line);
 
 		/* skip inode */
 		in += 1;
 		while (*in && *in != ' ')
 			++in;
 		if (*in != ' ')
-			die("missing ' '");
+			die("missing ' ' in '%s'", line);
 
 		/* backing (pathname) */
 		while (*in == ' ')
@@ -617,7 +626,7 @@ static void smaps_count_process(unsigned pid, struct pstats *total)
 	sprintf(path, "/proc/%u/smaps", pid);
 	sms_file = fopen(path, "r");
 	if (!sms_file)
-		die("fopen(/proc/PID/smaps) failed");
+		die("failed to open /proc/%u/smaps (%s)", pid, strerror(errno));
 
 	if (!fgets(line, sizeof(line), sms_file))
 		line[0] = '\0';
@@ -707,8 +716,9 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 	char backing[128];
 	struct pstats count;
 	uint64_t counted;
-	int64_t pm_offset;
-	int64_t kpcf_offset;
+	off_t pm_offset;
+	off_t kpcf_offset;
+	off_t res;
 	uint64_t pfn;
 	union {
 		uint64_t u;
@@ -718,12 +728,12 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 	sprintf(path, "/proc/%u/maps", pid);
 	ms_file = fopen(path, "r");
 	if (!ms_file)
-		die("fopen(/proc/PID/maps) failed");
+		die("failed to open %s (%s)", path, strerror(errno));
 
 	sprintf(path, "/proc/%u/pagemap", pid);
 	pm_fd = open(path, O_RDONLY);
 	if (pm_fd < 0)
-		die("open(/proc/PID/pagemap) failed");
+		die("failed to open %s (%s)", path, strerror(errno));
 
 	for (;;) {
 
@@ -738,8 +748,12 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 
 			counted = 0;
 			pm_offset = vstart / conf.page_size * sizeof(uint64_t);
-			if (lseek(pm_fd, pm_offset, SEEK_SET) != pm_offset)
-				die("lseek(pm_fd) failed");
+			res = lseek(pm_fd, pm_offset, SEEK_SET);
+			if (res < 0)
+				die("lseek(pm_fd) failed (%s)", strerror(errno));
+			if (res != pm_offset)
+				die("lseek(pm_fd) failed (%lld != %lld)",
+				    (long long)res, (long long)pm_offset);
 
 			while (counted < count.vm) {
 
@@ -749,8 +763,11 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 					counted += conf.page_size;
 					continue;
 				}
+				if (res < 0)
+					die("read(pm_fd) failed (%s)", strerror(errno));
 				if (res != sizeof(uint64_t))
-					die("read(pm_fd) failed");
+					die("read(pm_fd) failed (%llu != %zu)",
+					    (long long)res, sizeof(uint64_t));
 
 				if (pm.u & PMF_IN_RAM) {
 
@@ -758,20 +775,40 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 					kpcf_offset = pfn * sizeof(uint64_t);
 
 					/* kernel page flags */
-					if (lseek(kpf_fd, kpcf_offset, SEEK_SET) != kpcf_offset)
-						die("lseek(kpf_fd) failed");
+					res = lseek(kpf_fd, kpcf_offset, SEEK_SET);
+					if (res < 0)
+						die("lseek(kpf_fd) failed (%s)",
+						    strerror(errno));
+					if (res != kpcf_offset)
+						die("lseek(kpf_fd) failed (%lld != %lld)",
+						    (long long)res, (long long)kpcf_offset);
 
-					if (read(kpf_fd, kpf.b, sizeof(uint64_t)) != sizeof(uint64_t))
-						die("read(kpf_fd) failed");
+					res = read(kpf_fd, kpf.b, sizeof(uint64_t));
+					if (res < 0)
+						die("read(kpf_fd) failed (%s)",
+						    strerror(errno));
+					if (res != sizeof(uint64_t))
+						die("read(kpf_fd) failed (%lld != %zu)",
+						    (long long)res, sizeof(uint64_t));
 
 					count.rss += conf.page_size;
 
 					/* kernel page count */
-					if (lseek(kpc_fd, kpcf_offset, SEEK_SET) != kpcf_offset)
-						die("lseek(kpc_fd) failed");
+					res = lseek(kpc_fd, kpcf_offset, SEEK_SET);
+					if (res < 0)
+						die("lseek(kpc_fd) failed (%s)",
+						    strerror(errno));
+					if (res != kpcf_offset)
+						die("lseek(kpc_fd) failed (%lld != %lld)",
+						    (long long)res, (long long)kpcf_offset);
 
-					if (read(kpc_fd, kpc.b, sizeof(uint64_t)) != sizeof(uint64_t))
-						die("read(kpc_fd) failed");
+					res = read(kpc_fd, kpc.b, sizeof(uint64_t));
+					if (res < 0)
+						die("read(kpc_fd) failed (%s)",
+						    strerror(errno));
+					if (res != sizeof(uint64_t))
+						die("read(kpc_fd) failed (%lld != %zu)",
+						    (long long)res, sizeof(uint64_t));
 
 					if (args.bonus)
 						print_maps_bonus_info(pfn, kpf.u, kpc.u);
@@ -836,11 +873,11 @@ int main(int argc, char *argv[])
 	if (args.maps) {
 		kpc_fd = open("/proc/kpagecount", O_RDONLY);
 		if (kpc_fd < 0)
-			die("open(/proc/kpagecount) failed");
+			die("failed to open /proc/kpagecount (%s)", strerror(errno));
 
 		kpf_fd = open("/proc/kpageflags", O_RDONLY);
 		if (kpf_fd < 0)
-			die("open(/proc/kpageflags) failed");
+			die("failed to open /proc/kpageflags (%s)", strerror(errno));
 	}
 
 	if (!args.verbose)
@@ -868,7 +905,7 @@ int main(int argc, char *argv[])
 			sprintf(path, "/proc/%u/comm", *pid);
 			cmd_file = fopen(path, "r");
 			if (!cmd_file)
-				die("fopen(/proc/PID/comm) failed");
+				die("failed to open /proc/PID/comm (%s)", strerror(errno));
 
 			if (!fgets(&cmdline[1], sizeof(cmdline) - 2, cmd_file)) {
 				cmdline[0] = '\0';

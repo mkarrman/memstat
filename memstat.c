@@ -40,12 +40,30 @@
 #define MAX_EXCLUDES       16
 #define MAX_PID_COUNT      1023
 
+/* output fields */
+#define OF_PID             0x00000001
+#define OF_VM              0x00000002
+#define OF_RSS             0x00000004
+#define OF_SWP             0x00000008
+#define OF_USS             0x00000010
+#define OF_SHR             0x00000020
+#define OF_WSS             0x00000040
+#define OF_PERM            0x00000080
+#define OF_CMDLINE         0x00000100
+#define OF_PATHNAME        0x00000200
+#define OF_TOTALS          0x00000400
+
+#define OF_DEFAULT         (OF_PID | OF_VM | OF_RSS | OF_SWP | OF_USS | OF_SHR \
+                            | OF_WSS | OF_PERM | OF_CMDLINE | OF_PATHNAME \
+                            | OF_TOTALS)
+
 /* Non short-opt options */
 enum {
 	OPT_BONUS = 2,
 	OPT_EXCLUDE,
 	OPT_MAPS,
-	OPT_SMAPS
+	OPT_SMAPS,
+	OPT_FIELDS
 };
 
 /* process stats counters */
@@ -62,6 +80,7 @@ static struct {
 	unsigned kibyte : 1;
 	unsigned maps : 1;
 	unsigned verbose : 1;
+	unsigned of;
 	const char *exclude[MAX_EXCLUDES];
 	unsigned excl_len[MAX_EXCLUDES];
 	char perms[4];
@@ -114,6 +133,9 @@ static void print_help_and_exit(void)
 "                  May be specified multiple times. Special value 'ANON' will\n"
 "                  exclude anonymous mappings and '?' will exclude all but\n"
 "                  anonymous mappings.\n"
+"    --fields LIST Comma separated list of output fields to include in output.\n"
+"                  Select from 'Displayed metrics' below and the following:\n"
+"                  PID, PERM, CMDLINE, PATHNAME, TOTALS.\n"
 " -g --general     Show general system information.\n"
 " -k --kibyte      Display values in KiB instead of bytes.\n"
 "    --maps        Calculate based on maps, pagemap and kpagecount instead of\n"
@@ -186,6 +208,47 @@ static void die(const char *fmt, ...)
 	exit(EXIT_FAILURE);
 }
 
+static void parse_output_fields_arg(const char *list)
+{
+	char *l, *p;
+	const char *field;
+
+	l = strdup(list);
+	if (!l)
+		die("Failed to allocate fields memory");
+
+	p = l;
+	while (p) {
+		field = strsep(&p, ",");
+		if (!strcasecmp(field, "PID"))
+			args.of |= OF_PID;
+		else if (!strcasecmp(field, "VM"))
+			args.of |= OF_VM;
+		else if(!strcasecmp(field, "RSS"))
+			args.of |= OF_RSS;
+		else if(!strcasecmp(field, "SWP"))
+			args.of |= OF_SWP;
+		else if(!strcasecmp(field, "USS"))
+			args.of |= OF_USS;
+		else if(!strcasecmp(field, "SHR"))
+			args.of |= OF_SHR;
+		else if(!strcasecmp(field, "WSS"))
+			args.of |= OF_WSS;
+		else if(!strcasecmp(field, "PERM"))
+			args.of |= OF_PERM;
+		else if(!strcasecmp(field, "CMDLINE"))
+			args.of |= OF_CMDLINE;
+		else if(!strcasecmp(field, "PATHNAME"))
+			args.of |= OF_PATHNAME;
+		else if(!strcasecmp(field, "TOTALS"))
+			args.of |= OF_TOTALS;
+		else
+			die("Unknown field specifier \"%s\"", field);
+	}
+
+	free(l);
+}
+
 static int parse_command_line(int argc, char *argv[])
 {
 	static char sopt[] = "aghkprsvwx";
@@ -193,6 +256,7 @@ static int parse_command_line(int argc, char *argv[])
 		{ "all",       no_argument, 0, 'a' },
 		{ "bonus",     no_argument, 0, OPT_BONUS },
 		{ "exclude",   required_argument, 0, OPT_EXCLUDE },
+		{ "fields",    required_argument, 0, OPT_FIELDS },
 		{ "general",   no_argument, 0, 'g' },
 		{ "help",      no_argument, 0, 'h' },
 		{ "kibyte",    no_argument, 0, 'k' },
@@ -229,6 +293,9 @@ static int parse_command_line(int argc, char *argv[])
 			args.exclude[excludes] = optarg;
 			args.excl_len[excludes] = strlen(optarg);
 			++excludes;
+			break;
+		case OPT_FIELDS:
+			parse_output_fields_arg(optarg);
 			break;
 		case 'g':
 			args.general = 1;
@@ -276,6 +343,9 @@ static int parse_command_line(int argc, char *argv[])
 
 	if (!memcmp(args.perms, "---", 3))
 		args.perms[0] = '\0';
+
+	if (!args.of)
+		args.of = OF_DEFAULT;
 
 	return optind;
 }
@@ -408,6 +478,30 @@ static void get_system_meminfo(void)
 	fclose(meminfo_file);
 }
 
+static void print_heading_item(const char *caption, int width)
+{
+	static char str[32];
+	size_t clen;
+
+	if (width < 3 || width > (int)(sizeof(str) - 1))
+		die("Bad heading width (%u)", width);
+
+	memset(str, '-', width);
+	str[width] = '\0';
+
+	clen = strlen(caption);
+	if (clen > (size_t)(width - 2))
+		clen = width - 2;
+	memcpy(&str[1], caption, clen);
+
+	printf("%s ", str);
+}
+
+static void print_counts_item(uint64_t count, int width)
+{
+	printf("%*" PRIu64 " ", width, count);
+}
+
 static void print_general_info(void)
 {
 	uint64_t used;
@@ -437,17 +531,45 @@ static void print_general_info(void)
 	printf("\n");
 }
 
+static void print_field_headings(void)
+{
+	if (args.of & OF_VM)
+		print_heading_item("VM", 11);
+	if (args.of & OF_RSS)
+		print_heading_item("RSS", 11);
+	if (args.of & OF_SWP)
+		print_heading_item("SWP", 11);
+	if (args.of & OF_USS)
+		print_heading_item("USS", 11);
+	if (args.of & OF_SHR)
+		print_heading_item("SHR", 11);
+	if (args.of & OF_WSS)
+		print_heading_item("WSS", 11);
+}
+
 static void print_heading(void)
 {
-	printf("-PID--- -VM-------- -RSS------- -SWP------- -USS------- "
-	       "-SHR------- -WSS------- -Cmdline------- - - -\n");
+	if (args.of & OF_PID)
+		print_heading_item("PID", 7);
+	print_field_headings();
+	if (args.of & OF_CMDLINE)
+		print_heading_item("CmdLine", 20);
+	putchar('\n');
 }
 
 static void print_verbose_heading(unsigned pid, const char *cmdline)
 {
-	printf("%7u %s\n", pid, cmdline);
-	printf("        -VM-------- -RSS------- -SWP------- -USS------- "
-	       "-SHR------- -WSS------- perm -pathname------- - - -\n");
+	if (args.of & OF_PID)
+		printf("%7u ", pid);
+	if (args.of & OF_CMDLINE)
+		printf("%s", cmdline);
+	printf("\n        ");
+	print_field_headings();
+	if (args.of & OF_PERM)
+		printf("perm ");
+	if (args.of & OF_PATHNAME)
+		print_heading_item("pathname", 20);
+	putchar('\n');
 }
 
 static void print_maps_bonus_info(uint64_t pfn, uint64_t kpf, unsigned kpc)
@@ -461,34 +583,57 @@ static void print_smaps_bonus_info(const char *tag, uint64_t val)
 	printf("- %-17s%10" PRIu64 "\n", tag, val);
 }
 
+static void print_field_counts(struct pstats *count)
+{
+	if (args.of & OF_VM)
+		print_counts_item(count->vm, 11);
+	if (args.of & OF_RSS)
+		print_counts_item(count->rss, 11);
+	if (args.of & OF_SWP)
+		print_counts_item(count->swp, 11);
+	if (args.of & OF_USS)
+		print_counts_item(count->uss, 11);
+	if (args.of & OF_SHR)
+		print_counts_item(count->shr, 11);
+	if (args.of & OF_WSS)
+		print_counts_item(count->wss, 11);
+}
+
 static void print_verbose_counts(struct pstats *count,
                                  const char *perms, const char *backing)
 {
-	printf("        %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s %s\n",
-	       count->vm, count->rss, count->swp, count->uss,
-	       count->shr, count->wss, perms, backing);
+	printf("        ");
+	print_field_counts(count);
+	if (args.of & OF_PERM)
+		printf("%s ", perms);
+	if (args.of & OF_PATHNAME)
+		printf("%s", backing);
+	putchar('\n');
 }
 
 static void print_verbose_totals(struct pstats *total)
 {
-	printf("   Tot: %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 "\n",
-	       total->vm, total->rss, total->swp, total->uss,
-	       total->shr, total->wss);
+	if (args.of & OF_TOTALS) {
+		printf("   Tot: ");
+		print_field_counts(total);
+		putchar('\n');
+	}
 }
 
 static void print_totals(unsigned pid, struct pstats *total, const char *cmdline)
 {
-	printf("%7u %11" PRIu64 " %11" PRIu64 " %11" PRIu64
-	       " %11" PRIu64 " %11" PRIu64 " %11" PRIu64 " %s\n",
-	       pid, total->vm, total->rss, total->swp, total->uss,
-	       total->shr, total->wss, cmdline);
+	if (args.of & OF_PID)
+		printf("%7u ", pid);
+	print_field_counts(total);
+	if (args.of & OF_CMDLINE)
+		printf("%s", cmdline);
+	putchar('\n');
 }
 
 static void print_footer(uint64_t wss_grand_total)
 {
-	printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
+	if (args.of & OF_TOTALS)
+		printf("WSS grand total = %" PRIu64 "\n", wss_grand_total);
 }
 
 static void add_to_pstats(struct pstats *sum, struct pstats *add)

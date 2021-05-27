@@ -28,8 +28,14 @@
 
 
 /* kernel page flags */
+#define KPF_LOCKED         ((uint64_t)1 << 0)         /* Linux 2.6.25 */
+#define KPF_REFERENCED     ((uint64_t)1 << 2)         /* Linux 2.6.25 */
+#define KPF_UPTODATE       ((uint64_t)1 << 3)         /* Linux 2.6.25 */
+#define KPF_DIRTY          ((uint64_t)1 << 4)         /* Linux 2.6.25 */
+#define KPF_ANON           ((uint64_t)1 << 12)        /* Linux 2.6.31 */
 #define KPF_COMPOUND_HEAD  ((uint64_t)1 << 15)        /* Linux 2.6.31 */
 #define KPF_HUGE           ((uint64_t)1 << 17)        /* Linux 2.6.31 */
+#define KPF_UNEVICTABLE    ((uint64_t)1 << 18)        /* Linux 2.6.31 */
 #define KPF_THP            ((uint64_t)1 << 22)        /* Linux 3.4 */
 
 /* page map bit fields */
@@ -52,6 +58,13 @@
 #define OF_CMDLINE         0x00000100
 #define OF_PATHNAME        0x00000200
 #define OF_TOTALS          0x00000400
+#define OF_PRC             0x00000800
+#define OF_PRD             0x00001000
+#define OF_SHC             0x00002000
+#define OF_SHD             0x00004000
+#define OF_REF             0x00008000
+#define OF_ANON            0x00010000
+#define OF_LOCK            0x00020000
 
 #define OF_DEFAULT         (OF_PID | OF_VM | OF_RSS | OF_SWP | OF_USS | OF_SHR \
                             | OF_WSS | OF_PERM | OF_CMDLINE | OF_PATHNAME \
@@ -68,9 +81,20 @@ enum {
 
 /* process stats counters */
 struct pstats {
-	uint64_t vm, rss, swp, uss, shr, wss;
+	uint64_t vm;
+	uint64_t rss;
+	uint64_t swp;
+	uint64_t uss;
+	uint64_t prc;
+	uint64_t prd;
+	uint64_t shr;
+	uint64_t shc;
+	uint64_t shd;
+	uint64_t wss;  /* a.k.a. pss */
+	uint64_t ref;
+	uint64_t anon;
+	uint64_t lock;
 };
-
 
 /* command line arguments */
 static struct {
@@ -161,12 +185,17 @@ static void print_help_and_exit(void)
 " VM   Virtual Memory    - total size of all memory mapped.\n"
 " RSS  Resident Set Size - sum of all smaps 'Rss' values.\n"
 " SWP  Swap              - sum of all smaps 'Swap' values.\n"
-" USS  Unique Set Size   - sum of all smaps 'Private_Clean' and 'Private_Dirty'\n"
-"                          values.\n"
-" SHR  Shared            - sum of all smaps 'Shared_Clean' and 'Shared_Dirty'\n"
-"                          values.\n"
+" USS  Unique Set Size   - sum of PRC and PRD.\n"
+" PRC  Private Clean     - sum of all smaps 'Private_Clean' values.\n"
+" PRD  Private Dirty     - sum of all smaps 'Private_Dirty' values.\n"
+" SHR  Shared            - sum of SHC and SHD.\n"
+" SHC  Shared Clean      - sum of all smaps 'Shared_Clean' values.\n"
+" SHD  Shared Dirty      - sum of all smaps 'Shared_Dirty' values.\n"
 " WSS  Weighted Set Size - sum of all smaps 'Pss' and 'SwapPss' values\n"
-"                          (PSS = Proportional Set Size).\n"
+"                          (a.k.a. PSS = Proportional Set Size).\n"
+" REF  Referenced        - sum of all smaps 'Referenced' values.\n"
+" ANON Anonymous         - sum of all smaps 'Anonymous' values.\n"
+" LOCK Locked            - sum of all smaps 'Locked' values.\n"
 "\n"
 "Displayed metrics (in --maps mode):\n"
 " VM   Virtual Memory    - total size of all memory mapped.\n"
@@ -230,10 +259,24 @@ static void parse_output_fields_arg(const char *list)
 			args.of |= OF_SWP;
 		else if(!strcasecmp(field, "USS"))
 			args.of |= OF_USS;
+		else if(!strcasecmp(field, "PRC"))
+			args.of |= OF_PRC;
+		else if(!strcasecmp(field, "PRD"))
+			args.of |= OF_PRD;
 		else if(!strcasecmp(field, "SHR"))
 			args.of |= OF_SHR;
+		else if(!strcasecmp(field, "SHC"))
+			args.of |= OF_SHC;
+		else if(!strcasecmp(field, "SHD"))
+			args.of |= OF_SHD;
 		else if(!strcasecmp(field, "WSS"))
 			args.of |= OF_WSS;
+		else if(!strcasecmp(field, "REF"))
+			args.of |= OF_REF;
+		else if(!strcasecmp(field, "ANON"))
+			args.of |= OF_ANON;
+		else if(!strcasecmp(field, "LOCK"))
+			args.of |= OF_LOCK;
 		else if(!strcasecmp(field, "PERM"))
 			args.of |= OF_PERM;
 		else if(!strcasecmp(field, "CMDLINE"))
@@ -541,10 +584,24 @@ static void print_field_headings(void)
 		print_heading_item("SWP", 11);
 	if (args.of & OF_USS)
 		print_heading_item("USS", 11);
+	if (args.of & OF_PRC)
+		print_heading_item("PRC", 11);
+	if (args.of & OF_PRD)
+		print_heading_item("PRD", 11);
 	if (args.of & OF_SHR)
 		print_heading_item("SHR", 11);
+	if (args.of & OF_SHC)
+		print_heading_item("SHC", 11);
+	if (args.of & OF_SHD)
+		print_heading_item("SHD", 11);
 	if (args.of & OF_WSS)
 		print_heading_item("WSS", 11);
+	if (args.of & OF_REF)
+		print_heading_item("REF", 11);
+	if (args.of & OF_ANON)
+		print_heading_item("ANON", 11);
+	if (args.of & OF_LOCK)
+		print_heading_item("LOCK", 11);
 }
 
 static void print_heading(void)
@@ -578,9 +635,9 @@ static void print_maps_bonus_info(uint64_t pfn, uint64_t kpf, unsigned kpc)
 	       pfn * conf.page_size, kpf, kpc);
 }
 
-static void print_smaps_bonus_info(const char *tag, uint64_t val)
+static void print_smaps_bonus_info(const char *line)
 {
-	printf("- %-17s%10" PRIu64 "\n", tag, val);
+	printf("- %s\n", line);
 }
 
 static void print_field_counts(struct pstats *count)
@@ -593,10 +650,24 @@ static void print_field_counts(struct pstats *count)
 		print_counts_item(count->swp, 11);
 	if (args.of & OF_USS)
 		print_counts_item(count->uss, 11);
+	if (args.of & OF_PRC)
+		print_counts_item(count->prc, 11);
+	if (args.of & OF_PRD)
+		print_counts_item(count->prd, 11);
 	if (args.of & OF_SHR)
 		print_counts_item(count->shr, 11);
+	if (args.of & OF_SHC)
+		print_counts_item(count->shc, 11);
+	if (args.of & OF_SHD)
+		print_counts_item(count->shd, 11);
 	if (args.of & OF_WSS)
 		print_counts_item(count->wss, 11);
+	if (args.of & OF_REF)
+		print_counts_item(count->ref, 11);
+	if (args.of & OF_ANON)
+		print_counts_item(count->anon, 11);
+	if (args.of & OF_LOCK)
+		print_counts_item(count->lock, 11);
 }
 
 static void print_verbose_counts(struct pstats *count,
@@ -642,8 +713,15 @@ static void add_to_pstats(struct pstats *sum, struct pstats *add)
 	sum->rss += add->rss;
 	sum->swp += add->swp;
 	sum->uss += add->uss;
+	sum->prc += add->prc;
+	sum->prd += add->prd;
 	sum->shr += add->shr;
+	sum->shc += add->shc;
+	sum->shd += add->shd;
 	sum->wss += add->wss;
+	sum->ref += add->ref;
+	sum->anon += add->anon;
+	sum->lock += add->lock;
 }
 
 static void reduce_pstats_to_kib(struct pstats *pst)
@@ -652,8 +730,15 @@ static void reduce_pstats_to_kib(struct pstats *pst)
 	pst->rss >>= 10;
 	pst->swp >>= 10;
 	pst->uss >>= 10;
+	pst->prc >>= 10;
+	pst->prd >>= 10;
 	pst->shr >>= 10;
+	pst->shc >>= 10;
+	pst->shd >>= 10;
 	pst->wss >>= 10;
+	pst->ref >>= 10;
+	pst->anon >>= 10;
+	pst->lock >>= 10;
 }
 
 static void parse_maps_line(const char *line, uint64_t *vstart, uint64_t *vsize,
@@ -750,13 +835,45 @@ static int included_mapping(const char *perms, const char *backing)
 	return 1;
 }
 
-static void smaps_bonus_info(const char *tag, const char *line)
+static void smaps_parse_tag_line(const char *line, struct pstats *count)
 {
-	uint64_t val;
+	uint64_t tmp;
 
-	val = read_proc_count(&line[strlen(tag)]);
-	if (val)
-		print_smaps_bonus_info(tag, val);
+	if (!memcmp(line, "Rss:", 4)) {
+		count->rss += read_proc_count(&line[4]);
+	} else if (!memcmp(line, "Pss:", 4)) {
+		count->wss += read_proc_count(&line[4]);
+	} else if (!memcmp(line, "Shared_Clean:", 13)) {
+		tmp = read_proc_count(&line[13]);
+		count->shr += tmp;
+		count->shc += tmp;
+	} else if (!memcmp(line, "Shared_Dirty:", 13)) {
+		tmp = read_proc_count(&line[13]);
+		count->shr += tmp;
+		count->shd += tmp;
+	} else if (!memcmp(line, "Private_Clean:", 14)) {
+		tmp = read_proc_count(&line[14]);
+		count->uss += tmp;
+		count->prc += tmp;
+	} else if (!memcmp(line, "Private_Dirty:", 14)) {
+		tmp = read_proc_count(&line[14]);
+		count->uss += tmp;
+		count->prd += tmp;
+	} else if (!memcmp(line, "Referenced:", 11)) {
+		count->ref += read_proc_count(&line[11]);
+	} else if (!memcmp(line, "Anonymous:", 10)) {
+		count->anon += read_proc_count(&line[10]);
+	} else if (!memcmp(line, "LazyFree:", 9)) {
+		count->anon += read_proc_count(&line[9]);
+	} else if (!memcmp(line, "Swap:", 5)) {
+		count->swp += read_proc_count(&line[5]);
+	} else if (!memcmp(line, "SwapPss:", 8)) {
+		count->wss += read_proc_count(&line[8]);
+	} else if (!memcmp(line, "Locked:", 7)) {
+		count->lock += read_proc_count(&line[7]);
+	} else if (args.bonus) {
+		print_smaps_bonus_info(line);
+	}
 }
 
 static void smaps_count_process(unsigned pid, struct pstats *total)
@@ -792,38 +909,7 @@ static void smaps_count_process(unsigned pid, struct pstats *total)
 				    line[0] < 'A' || line[0] > 'Z')
 					break;
 
-				if (!memcmp(line, "Rss:", 4))
-					count.rss += read_proc_count(&line[4]);
-				else if (!memcmp(line, "Pss:", 4))
-					count.wss += read_proc_count(&line[4]);
-				else if (!memcmp(line, "Shared_Clean:", 13))
-					count.shr += read_proc_count(&line[13]);
-				else if (!memcmp(line, "Shared_Dirty:", 13))
-					count.shr += read_proc_count(&line[13]);
-				else if (!memcmp(line, "Private_Clean:", 14))
-					count.uss += read_proc_count(&line[14]);
-				else if (!memcmp(line, "Private_Dirty:", 14))
-					count.uss += read_proc_count(&line[14]);
-				else if (!memcmp(line, "Swap:", 5))
-					count.swp += read_proc_count(&line[5]);
-				else if (!memcmp(line, "SwapPss:", 8))
-					count.wss += read_proc_count(&line[8]);
-				else if (args.bonus) {
-					if (!memcmp(line, "LazyFree:", 9))
-						smaps_bonus_info("LazyFree:", line);
-					else if (!memcmp(line, "AnonHugePages:", 14))
-						smaps_bonus_info("AnonHugePages:", line);
-					else if (!memcmp(line, "ShmemHugePages:", 15))
-						smaps_bonus_info("ShmemHugePages:", line);
-					else if (!memcmp(line, "ShmemPmdMapped:", 15))
-						smaps_bonus_info("ShmemPmdMapped:", line);
-					else if (!memcmp(line, "FilePmdMapped:", 14))
-						smaps_bonus_info("FilePmdMapped:", line);
-					else if (!memcmp(line, "Shared_Hugetlb:", 15))
-						smaps_bonus_info("Shared_Hugetlb:", line);
-					else if (!memcmp(line, "Private_Hugetlb:", 16))
-						smaps_bonus_info("Private_Hugetlb:", line);
-				}
+				smaps_parse_tag_line(line, &count);
 			}
 
 			add_to_pstats(total, &count);
@@ -962,11 +1048,27 @@ static void maps_count_process(unsigned pid, int kpc_fd, int kpf_fd,
 						/* should never be... */
 					} else if (kpc.u == 1) {
 						count.uss += conf.page_size;
+						//TODO: Not working a smaps!
+						if (kpf.u & KPF_DIRTY)
+							count.prd += conf.page_size;
+						else
+							count.prc += conf.page_size;
 						count.wss += conf.page_size;
 					} else {
 						count.shr += conf.page_size;
+						if (kpf.u & KPF_DIRTY)
+							count.shd += conf.page_size;
+						else
+							count.shc += conf.page_size;
 						count.wss += (conf.page_size + kpc.u/2) / kpc.u;
 					}
+
+					if (kpf.u & KPF_REFERENCED)
+						count.ref += conf.page_size;
+					if (kpf.u & KPF_ANON)
+						count.anon += conf.page_size;
+					if (kpf.u & (KPF_LOCKED | KPF_UNEVICTABLE))
+						count.lock += conf.page_size;
 
 				} else if (pm.u & PMF_IN_SWAP) {
 
